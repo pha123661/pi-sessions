@@ -993,6 +993,19 @@ export default function (pi: ExtensionAPI) {
 			openSessions(ctx, host),
 	});
 
+	pi.on("session_start", async (_event: any, ctx: CommandContext) => {
+		if (ctx.mode !== "tui") return;
+		ctx.ui.onTerminalInput?.((data: string) => {
+			if (data === "\x1b[D") { // Left Arrow
+				try {
+					if (!ctx.ui.getEditorText().trim()) {
+						void openSessions(ctx, host);
+					}
+				} catch {}
+			}
+		});
+	});
+
 	pi.registerShortcut("ctrl+r", {
 		description: "Open sessions switcher",
 		handler: async (ctx: CommandContext) => openSessions(ctx, host),

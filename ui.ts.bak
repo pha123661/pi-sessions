@@ -856,7 +856,6 @@ class SessionsView {
 	private folderExplorer: FileExplorer | null = null;
 	private resumePicker: ResumeSessionPicker | null = null;
 	private timer: NodeJS.Timeout | null = null;
-	private showPeek = false;
 
 	constructor(
 		theme: any,
@@ -986,13 +985,8 @@ class SessionsView {
 			this.resumePicker.handleInput(data);
 			return;
 		}
-		if (matchesKey(data, "escape") || data === "\x1b[D") { // Esc or Left Arrow
+		if (matchesKey(data, "escape")) {
 			this.close();
-			return;
-		}
-		if (data === " ") { // Space for peek panel
-			this.showPeek = !this.showPeek;
-			this.requestRender();
 			return;
 		}
 		if (isCtrl(data, "o")) {
@@ -1013,10 +1007,26 @@ class SessionsView {
 			return;
 		}
 		if (isCtrl(data, "r")) {
-			// Instead of resume picker, Ctrl+R is now rename in Claude Code V2 mimicry.
-			// Implementing a full rename prompt would require another input state.
-            // For now, we'll notify it's a stub or trigger a basic rename UI if we had one.
-            this.actions.notify("Rename shortcut pressed (stub)", "info");
+			if (!this.actions.getResumeSessions) {
+				void this.actions.resumeSession().then(() => this.close());
+				return;
+			}
+			this.resumePicker = new ResumeSessionPicker(
+				this.theme,
+				this.actions.getResumeSessions,
+				(sessionPath: string | null) => {
+					this.resumePicker = null;
+					if (sessionPath) {
+						void this.actions
+							.resumeSession(sessionPath)
+							.then(() => this.close());
+					} else {
+						this.requestRender();
+					}
+				},
+				this.requestRender,
+			);
+			this.requestRender();
 			return;
 		}
 		if (matchesKey(data, "up") || isCtrl(data, "p")) {
@@ -1032,23 +1042,13 @@ class SessionsView {
 			this.requestRender();
 			return;
 		}
-		if (matchesKey(data, "return") || matchesKey(data, "enter") || data === "\x1b[C") { // Enter or Right Arrow
-            const val = this.filterInput.getValue().trim();
-            const session = this.selectedSession();
-            if (val) {
-                // Dispatch text
-                // In a real V2 we would send this to the waiting background session
-                // For this MVP we just notify.
-                this.actions.notify("Quick reply / Dispatch sent (stub): " + val, "info");
-                this.filterInput.setValue("");
-            } else {
-                // Attach
-                if (!session) return;
-                void this.actions.switchTo(session.id).then(() => this.close());
-            }
+		if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+			const session = this.selectedSession();
+			if (!session) return;
+			void this.actions.switchTo(session.id).then(() => this.close());
 			return;
 		}
-		if (isCtrl(data, "x") || isCtrl(data, "k")) {
+		if (isCtrl(data, "k")) {
 			const session = this.selectedSession();
 			if (!session) return;
 			if (session.id === PARENT_SESSION_ID) {
@@ -1110,8 +1110,15 @@ class SessionsView {
 		const attached = this.actions.getAttached();
 		const visibleSessions = this.filteredSessions();
 		const total = Math.max(1, visibleSessions.length);
+		const index = Math.min(this.selected + 1, total);
+		const prefix = `${index}/${total}\tSessions: `;
+		const renderedInput = renderInputChild(
+			this.filterInput,
+			width - visibleWidth(prefix),
+		);
 
-		lines.push(accent("Agent View") + dim(" · ") + muted(`${total} sessions`));
+		lines.push(border());
+		lines.push(accent(fits(width, `${prefix}${renderedInput}`)));
 		lines.push(border("dim"));
 
 		const startIdx = this.visibleStart(visibleSessions.length);
@@ -1169,36 +1176,21 @@ class SessionsView {
 			}
 		}
 		this.padRows(lines, width, rendered, this.sessions.length);
-        lines.push(border("dim"));
-        
-        // Peek panel
-        if (this.showPeek) {
-            const selectedSession = this.selectedSession();
-            lines.push(accent(" Peek ") + dim("─".repeat(Math.max(0, width - 6))));
-            const trText = selectedSession?.transcript || "(no recent activity)";
-            const parts = trText.split("\n");
-            for (const pt of parts) {
-                lines.push(padVisible("  " + pt, width));
-            }
-            lines.push(border("dim"));
-        }
-
-        // Input bottom bar
-		const renderedInput = renderInputChild(this.filterInput, width - 2);
-        lines.push(accent("❯ ") + renderedInput);
-        
+		lines.push(border());
 		lines.push(
 			padVisible(
-				dim("←") +
-					muted(" detach · ") +
-					dim("→/<enter>") +
-					muted(" attach · ") +
-					dim("<space>") +
-					muted(" peek · ") +
-					dim("<C-x>") +
+				dim("↑↓/<C-p>/<C-n>") +
+					muted(" move · ") +
+					dim("<enter>") +
+					muted(" switch · ") +
+					dim("<C-o>") +
+					muted(" new in folder · ") +
+					dim("<C-r>") +
+					muted(" resume · ") +
+					dim("<C-k>") +
 					muted(" kill · ") +
-                    dim("<C-r>") +
-                    muted(" rename"),
+					dim("<esc>") +
+					muted(" close"),
 				width,
 			),
 		);
@@ -1215,6 +1207,7 @@ class SessionsView {
 		if (this.timer) clearInterval(this.timer);
 	}
 }
+
 export async function showSessionsView(
 	ctx: any,
 	actions: SessionsActions,
