@@ -115,6 +115,30 @@ function renderInputChild(input: Input, width: number): string {
 	return line.startsWith("> ") ? line.slice(2) : line;
 }
 
+function renderTaskInput(
+	input: Input,
+	width: number,
+	theme: any,
+	placeholder = "describe a task for a new session",
+): string {
+	input.focused = true;
+	const prompt = theme.fg("accent", "❯ ");
+	const availableWidth = Math.max(10, width - 2);
+	const rendered = input.render(availableWidth)[0] ?? "";
+	const content = rendered.startsWith("> ") ? rendered.slice(2) : rendered;
+
+	if (!input.getValue()) {
+		const cursorEndIdx = content.indexOf("\x1b[27m");
+		if (cursorEndIdx !== -1) {
+			const cursorPart = content.slice(0, cursorEndIdx + 5);
+			const phText = theme.fg("dim", ` ${placeholder}`);
+			const remainingWidth = Math.max(0, width - 2 - 1 - visibleWidth(placeholder));
+			return `${prompt}${cursorPart}${phText}${" ".repeat(remainingWidth)}`;
+		}
+	}
+	return `${prompt}${content}`;
+}
+
 function shortenPath(p: string): string {
 	const home = homedir();
 	if (!p) return p;
@@ -274,132 +298,6 @@ export class SessionWidget implements Component {
 			clearInterval(this.timer);
 			this.timer = null;
 		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Multiline Task Prompt
-// ---------------------------------------------------------------------------
-class MultilinePrompt {
-	lines: string[] = [""];
-	cursorRow = 0;
-	cursorCol = 0;
-
-	isEmpty(): boolean {
-		return this.lines.length === 1 && this.lines[0].length === 0;
-	}
-
-	getValue(): string {
-		return this.lines.join("\n");
-	}
-
-	setValue(text: string): void {
-		this.lines = text ? text.split("\n") : [""];
-		this.cursorRow = this.lines.length - 1;
-		this.cursorCol = this.lines[this.cursorRow].length;
-	}
-
-	clear(): void {
-		this.lines = [""];
-		this.cursorRow = 0;
-		this.cursorCol = 0;
-	}
-
-	handleInput(data: string): void {
-		// Newline insertion: Ctrl+J or \n
-		if (data === "\n" || data === "\x0a") {
-			const curLine = this.lines[this.cursorRow] ?? "";
-			const before = curLine.slice(0, this.cursorCol);
-			const after = curLine.slice(this.cursorCol);
-			this.lines[this.cursorRow] = before;
-			this.lines.splice(this.cursorRow + 1, 0, after);
-			this.cursorRow++;
-			this.cursorCol = 0;
-			return;
-		}
-
-		// Backspace
-		if (data === "\x7f" || data === "\x08") {
-			const curLine = this.lines[this.cursorRow] ?? "";
-			if (this.cursorCol > 0) {
-				this.lines[this.cursorRow] =
-					curLine.slice(0, this.cursorCol - 1) + curLine.slice(this.cursorCol);
-				this.cursorCol--;
-			} else if (this.cursorRow > 0) {
-				const prevLine = this.lines[this.cursorRow - 1] ?? "";
-				this.cursorCol = prevLine.length;
-				this.lines[this.cursorRow - 1] = prevLine + curLine;
-				this.lines.splice(this.cursorRow, 1);
-				this.cursorRow--;
-			}
-			return;
-		}
-
-		// Left arrow
-		if (data === "\x1b[D") {
-			if (this.cursorCol > 0) {
-				this.cursorCol--;
-			} else if (this.cursorRow > 0) {
-				this.cursorRow--;
-				this.cursorCol = this.lines[this.cursorRow].length;
-			}
-			return;
-		}
-
-		// Right arrow
-		if (data === "\x1b[C") {
-			const curLine = this.lines[this.cursorRow] ?? "";
-			if (this.cursorCol < curLine.length) {
-				this.cursorCol++;
-			} else if (this.cursorRow < this.lines.length - 1) {
-				this.cursorRow++;
-				this.cursorCol = 0;
-			}
-			return;
-		}
-
-		// Up arrow in multiline
-		if (data === "\x1b[A") {
-			if (this.cursorRow > 0) {
-				this.cursorRow--;
-				this.cursorCol = Math.min(this.cursorCol, this.lines[this.cursorRow].length);
-			}
-			return;
-		}
-
-		// Down arrow in multiline
-		if (data === "\x1b[B") {
-			if (this.cursorRow < this.lines.length - 1) {
-				this.cursorRow++;
-				this.cursorCol = Math.min(this.cursorCol, this.lines[this.cursorRow].length);
-			}
-			return;
-		}
-
-		// Ignore escape control sequences
-		if (data.startsWith("\x1b")) return;
-
-		// Printable character insertion
-		const curLine = this.lines[this.cursorRow] ?? "";
-		const before = curLine.slice(0, this.cursorCol);
-		const after = curLine.slice(this.cursorCol);
-		this.lines[this.cursorRow] = before + data + after;
-		this.cursorCol += data.length;
-	}
-
-	render(width: number, theme: any): string[] {
-		if (this.isEmpty()) {
-			return [
-				padVisible(
-					`${theme.fg("accent", "❯ ")}${theme.fg("dim", "describe a task for a new session")}`,
-					width,
-				),
-			];
-		}
-		return this.lines.map((line, idx) => {
-			const prefix = idx === 0 ? theme.fg("accent", "❯ ") : "  ";
-			return padVisible(`${prefix}${line}`, width);
-		});
 	}
 }
 
@@ -585,7 +483,7 @@ class SessionsView {
 	private loading = true;
 	private error: string | null = null;
 	private closed = false;
-	private readonly taskPrompt = new MultilinePrompt();
+	private readonly taskInput = new Input();
 	private renameMode = false;
 	private readonly renameInput = new Input();
 	private showPeek = false;
@@ -601,6 +499,7 @@ class SessionsView {
 		private readonly actions: SessionsActions,
 		private readonly requestRender: () => void,
 	) {
+		this.taskInput.focused = true;
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 1200);
 	}
@@ -789,29 +688,22 @@ class SessionsView {
 		}
 
 		// -------------------------------------------------------------------
-		// When Task Prompt IS NOT EMPTY:
-		// Normal typing mode (characters go into the prompt, including ?, @, space)
+		// When Task Input IS NOT EMPTY:
+		// Normal typing mode (characters go into the input, including ?, @, space)
 		// -------------------------------------------------------------------
-		if (!this.taskPrompt.isEmpty()) {
-			// Ctrl+J: insert newline
-			if (isCtrl(data, "j")) {
-				this.taskPrompt.handleInput("\n");
-				this.requestRender();
-				return;
-			}
-
-			// Esc or Ctrl+C: clear prompt
+		if (this.taskInput.getValue().length > 0) {
+			// Esc or Ctrl+C: clear input
 			if (matchesKey(data, "escape") || isCtrl(data, "c")) {
-				this.taskPrompt.clear();
+				this.taskInput.setValue("");
 				this.requestRender();
 				return;
 			}
 
 			// Enter: dispatch task in background
 			if (matchesKey(data, "return") || matchesKey(data, "enter")) {
-				const taskText = this.taskPrompt.getValue().trim();
+				const taskText = this.taskInput.getValue().trim();
 				if (taskText) {
-					this.taskPrompt.clear();
+					this.taskInput.setValue("");
 					if (this.actions.dispatchSession) {
 						void this.actions.dispatchSession(taskText).then(() => {
 							this.notify("Session dispatched in background", "info");
@@ -823,14 +715,14 @@ class SessionsView {
 				return;
 			}
 
-			// Forward character (e.g. "?", "@", space, letters, backspace, arrows) to multiline prompt
-			this.taskPrompt.handleInput(data);
+			// Forward character / arrow / edit keys to native Input
+			this.taskInput.handleInput(data);
 			this.requestRender();
 			return;
 		}
 
 		// -------------------------------------------------------------------
-		// When Task Prompt IS EMPTY:
+		// When Task Input IS EMPTY:
 		// Navigation and shortcut mode
 		// -------------------------------------------------------------------
 
@@ -1008,8 +900,8 @@ class SessionsView {
 			return;
 		}
 
-		// Any other key starts typing into the prompt
-		this.taskPrompt.handleInput(data);
+		// Any other key starts typing into the input
+		this.taskInput.handleInput(data);
 		this.requestRender();
 	}
 
@@ -1125,10 +1017,8 @@ class SessionsView {
 
 		// 4. Fill vertical blank lines to anchor input bar at bottom
 		const termHeight = process.stdout.rows || 24;
-		const promptRenderedLines = this.taskPrompt.render(width, th);
-		const promptHeight = this.renameMode ? 1 : promptRenderedLines.length;
 		const footerHeight = this.showShortcuts ? 2 : 1;
-		const bottomAreaHeight = 2 + promptHeight + footerHeight; // rules + prompt + footer
+		const bottomAreaHeight = 2 + 1 + footerHeight; // rules + 1-line prompt + footer
 		const remaining = Math.max(1, termHeight - lines.length - bottomAreaHeight);
 		for (let i = 0; i < remaining; i++) {
 			lines.push(" ".repeat(width));
@@ -1141,9 +1031,7 @@ class SessionsView {
 			const inputRendered = renderInputChild(this.renameInput, width - 12);
 			lines.push(padVisible(`${prompt}${inputRendered}`, width));
 		} else {
-			for (const pLine of promptRenderedLines) {
-				lines.push(pLine);
-			}
+			lines.push(renderTaskInput(this.taskInput, width, th));
 		}
 		lines.push(border("dim"));
 
@@ -1160,7 +1048,7 @@ class SessionsView {
 			const line1 =
 				"  ctrl+s to switch views    ctrl+t to pin to top    @ retrieve session    esc to quit";
 			const line2 =
-				"  ctrl+j for newline        alt+1 to open           ctrl+x to remove      ? to close";
+				"  ctrl+r to rename          alt+1 to open           ctrl+x to remove      ? to close";
 			lines.push(padVisible(dim(line1), width));
 			lines.push(padVisible(dim(line2), width));
 		}
@@ -1169,6 +1057,7 @@ class SessionsView {
 	}
 
 	invalidate(): void {
+		this.taskInput.invalidate();
 		this.renameInput.invalidate();
 	}
 

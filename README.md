@@ -39,8 +39,8 @@ Completed
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ❯ describe a task for a new session
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-  ctrl+r to rename          ctrl+j for newline    ctrl+t to pin to top    ctrl+x to stop    ? to close
-  ctrl+s to switch views    @ to mention          alt+1 to open           esc to quit
+  ctrl+s to switch views    ctrl+t to pin to top    @ retrieve session    esc to quit
+  ctrl+r to rename          alt+1 to open           ctrl+x to remove      ? to close
 ```
 
 ## Core Interactions & Shortcuts
@@ -52,9 +52,7 @@ Completed
 ### 2. Task Dispatching (`❯ describe a task for a new session`)
 - Typing directly in the prompt bar is for describing a **new task**.
 - **`Enter`**: Spawns a new background session in the current folder, immediately begins executing the prompt, places it under `Working` with `✻`, and leaves the Agent View open so you can monitor progress or dispatch more tasks.
-- **`Ctrl+Enter`**: Dispatches the task and immediately attaches the terminal to the new session.
 - **`Enter` on empty input**: Attaches to the selected session.
-- **`Ctrl+J` / `Shift+Enter`**: Inserts a newline into the dispatch prompt.
 
 ### 3. Session Grouping & Status
 Sessions are dynamically grouped:
