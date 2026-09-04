@@ -17,6 +17,14 @@
       {
         "kind": "directory",
         "path": ""
+      },
+      {
+        "kind": "directory",
+        "path": "~/.pi/agent/git/github.com/pha123661"
+      },
+      {
+        "kind": "directory",
+        "path": "~/.pi/agent"
       }
     ]
   },

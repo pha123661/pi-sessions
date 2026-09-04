@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
 // @ts-nocheck
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -121,149 +121,24 @@ function hasExistingMessages(sessionManager: any): boolean {
 	return (sessionManager.buildSessionContext?.().messages?.length ?? 0) > 0;
 }
 
-function inferThinkingLevel(ctx: CommandContext): string | undefined {
-	const branch = ctx.sessionManager?.getBranch?.() ?? [];
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const entry = branch[i];
-		if (entry?.type === "thinking_level_change" && entry.thinkingLevel) {
-			return entry.thinkingLevel;
-		}
-	}
-	return undefined;
-}
-
-function collectRuntimeInheritance(ctx?: CommandContext): any {
-	if (!ctx) return {};
-	const promptOptions = ctx.getSystemPromptOptions?.() ?? {};
-	const sessionOptions: any = {};
-	if (Array.isArray(promptOptions.selectedTools)) {
-		sessionOptions.tools = [...promptOptions.selectedTools];
-	}
-	if (ctx.model) sessionOptions.model = ctx.model;
-	const thinkingLevel = inferThinkingLevel(ctx);
-	if (thinkingLevel) sessionOptions.thinkingLevel = thinkingLevel;
-	return {
-		ctx,
-		authStorage: ctx.modelRegistry?.authStorage,
-		sessionOptions,
-	};
+function resetExtendedKeyboardModesForHandoff(): void {
+	if (!process.stdin.isTTY) return;
+	process.stdout.write("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u");
 }
 
 function safeCollectRuntimeInheritance(ctx?: CommandContext): any {
-	try {
-		return collectRuntimeInheritance(ctx);
-	} catch {
-		return {};
-	}
-}
-
-function createInheritedSettingsManager(
-	cwd: string,
-	agentDir: string,
-	inheritance: any,
-): { settingsManager: any; diagnostics: any[] } {
-	const diagnostics: any[] = [];
-	const sameCwd =
-		inheritance?.ctx?.cwd &&
-		path.resolve(inheritance.ctx.cwd) === path.resolve(cwd);
-	let projectTrusted = true;
-	if (sameCwd) {
-		projectTrusted = inheritance.ctx.isProjectTrusted?.() ?? true;
-	} else if (hasTrustRequiringProjectResources(cwd)) {
-		const trustStore = new ProjectTrustStore(agentDir);
-		projectTrusted = trustStore.get(cwd) === true;
-		if (!projectTrusted) {
-			diagnostics.push({
-				type: "warning",
-				message: `Project resources in child cwd are not trusted: ${cwd}`,
-			});
-		}
-	}
+	if (!ctx) return undefined;
+	const mode = (ctx as any).mode;
+	const session = ctx.sessionManager;
 	return {
-		settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted }),
-		diagnostics,
+		cwd: ctx.cwd,
+		model: ctx.model,
+		thinkingLevel: ctx.thinkingLevel,
+		sessionFile: session?.getSessionFile?.(),
+		sessionId: session?.getSessionId?.(),
+		leafId: session?.getLeafId?.(),
+		isBashMode: mode?.isBashMode,
 	};
-}
-
-async function resolveChildSessionOptions(
-	services: any,
-	sessionManager: any,
-	inheritance: any,
-): Promise<any> {
-	const options: any = { ...(inheritance?.sessionOptions ?? {}) };
-	const existing = hasExistingMessages(sessionManager);
-	if (existing) {
-		delete options.model;
-		delete options.thinkingLevel;
-	}
-
-	const patterns = services.settingsManager?.getEnabledModels?.();
-	if (!patterns?.length) return options;
-
-	const { resolveModelScope } = await loadModelResolver();
-	const scopedModels = await resolveModelScope(
-		patterns,
-		services.modelRegistry,
-	);
-	if (!scopedModels.length) return options;
-
-	options.scopedModels = scopedModels;
-	if (!existing) {
-		const inheritedModel = inheritance?.sessionOptions?.model;
-		const savedProvider = services.settingsManager?.getDefaultProvider?.();
-		const savedModelId = services.settingsManager?.getDefaultModel?.();
-		const savedModel =
-			savedProvider && savedModelId
-				? services.modelRegistry.find(savedProvider, savedModelId)
-				: undefined;
-		const selected =
-			scopedModels.find((scoped: any) =>
-				sameModel(scoped.model, inheritedModel),
-			) ??
-			scopedModels.find((scoped: any) => sameModel(scoped.model, savedModel)) ??
-			scopedModels[0];
-		options.model = selected.model;
-		if (selected.thinkingLevel) options.thinkingLevel = selected.thinkingLevel;
-	}
-
-	return options;
-}
-
-function asString(value: unknown): string | null {
-	return typeof value === "string" && value.trim() ? value : null;
-}
-
-function inferToolPaths(toolName: string, input: any): string[] {
-	const paths = new Set<string>();
-	if (toolName === "write" || toolName === "edit") {
-		const p =
-			asString(input?.path) ||
-			asString(input?.file_path) ||
-			asString(input?.filePath);
-		if (p) paths.add(p);
-	}
-	if (toolName === "bash") {
-		const command = asString(input?.command) || "";
-		const redir = [...command.matchAll(/(?:>|>>|2>|&>)\s*([^\s;&|]+)/g)].map(
-			(m) => m[1],
-		);
-		for (const p of redir) {
-			if (p && !p.startsWith("/dev/")) paths.add(p.replace(/^["']|["']$/g, ""));
-		}
-		const mutating =
-			/\b(rm|mv|cp|touch|mkdir|rmdir|chmod|chown|install|tee|sed\s+-i|perl\s+-i|python\b.*\b(open|write)|node\b.*writeFile)\b/.test(
-				command,
-			);
-		if (mutating) {
-			const tokens = command.match(/(?:\.\.?|~|\/)?[\w@%+=:,./-]+/g) || [];
-			for (const token of tokens) {
-				if (token.includes("/") || token.startsWith("."))
-					paths.add(token.replace(/^["']|["']$/g, ""));
-			}
-			if (paths.size === 0) paths.add(".");
-		}
-	}
-	return [...paths];
 }
 
 function needsPermission(
@@ -272,73 +147,112 @@ function needsPermission(
 	sessionName: string,
 ): string | null {
 	if (toolName === "bash") {
-		const command = asString(input?.command) || "";
-		if (/\bsudo\b|\brm\s+(-rf?|--recursive|--force)/i.test(command)) {
-			return `Dangerous bash command in ${sessionName}: ${command}`;
+		const command = String(input?.command || "");
+		if (command.includes("rm ") || command.includes("dropdb")) {
+			return `Session "${sessionName}" wants to run potentially destructive bash: ${command.slice(0, 100)}`;
 		}
 	}
 	return null;
 }
 
-function resetExtendedKeyboardModesForHandoff(): void {
+const branchCache = new Map<string, { branch: string; time: number }>();
+
+function getGitBranch(cwd: string): string {
+	if (!cwd) return "";
+	const cached = branchCache.get(cwd);
+	if (cached && Date.now() - cached.time < 10000) {
+		return cached.branch;
+	}
 	try {
-		process.stdout.write("\x1b[<999u\x1b[>4;0m");
+		const branch = execSync("git rev-parse --abbrev-ref HEAD", {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 1000,
+		}).trim();
+		branchCache.set(cwd, { branch, time: Date.now() });
+		return branch;
+	} catch {
+		branchCache.set(cwd, { branch: "", time: Date.now() });
+		return "";
+	}
+}
+
+function getDefaultScope(): "current" | "all" {
+	try {
+		const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+		if (fs.existsSync(settingsPath)) {
+			const raw = fs.readFileSync(settingsPath, "utf8");
+			const data = JSON.parse(raw);
+			if (data?.sessions?.defaultScope === "all" || data?.sessionsDefaultScope === "all") {
+				return "all";
+			}
+		}
+	} catch {}
+	return "current";
+}
+
+// ---------------------------------------------------------------------------
+// Multiplexed Sessions Persistent Registry
+// ---------------------------------------------------------------------------
+const REGISTRY_FILE = path.join(os.homedir(), ".pi", "agent", "multiplexed-sessions.json");
+
+export interface StoredMultiplexSession {
+	id: string;
+	sessionFile: string;
+	cwd: string;
+	name: string;
+	pinned?: boolean;
+	createdAt: number;
+	lastActivityAt: number;
+}
+
+function loadMultiplexRegistry(): StoredMultiplexSession[] {
+	try {
+		if (fs.existsSync(REGISTRY_FILE)) {
+			const raw = fs.readFileSync(REGISTRY_FILE, "utf8");
+			return JSON.parse(raw).sessions || [];
+		}
+	} catch {}
+	return [];
+}
+
+function saveMultiplexRegistry(sessions: StoredMultiplexSession[]): void {
+	try {
+		const dir = path.dirname(REGISTRY_FILE);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(REGISTRY_FILE, JSON.stringify({ sessions }, null, 2));
 	} catch {}
 }
 
-function normalizeLockPath(p: string, cwd: string): string | null {
-	if (!p || typeof p !== "string") return null;
-	if (p.startsWith("~")) return path.join(os.homedir(), p.slice(1));
-	return path.resolve(cwd || process.cwd(), p);
-}
+class PathLockManager {
+	private locks = new Map<string, { sessionId: string; acquiredAt: number }>();
 
-function pathsConflict(a: string, b: string): boolean {
-	const ar = a.endsWith(path.sep) ? a : a + path.sep;
-	const br = b.endsWith(path.sep) ? b : b + path.sep;
-	return a === b || a.startsWith(br) || b.startsWith(ar);
-}
-
-class LockManager {
-	locks = new Map<string, { sessionId: string; acquiredAt: number }>();
-	heldByToolCall = new Map<string, { sessionId: string; paths: string[] }>();
-
-	acquire(sessionId: string, rawPaths: string[], cwd: string) {
-		const paths = [
-			...new Set(
-				(rawPaths || []).map((p) => normalizeLockPath(p, cwd)).filter(Boolean),
-			),
-		].sort();
-		const conflicts = [];
-		for (const p of paths) {
-			for (const [held, info] of this.locks.entries()) {
-				if (info.sessionId !== sessionId && pathsConflict(p, held)) {
-					conflicts.push({ path: p, heldPath: held, by: info.sessionId });
-				}
+	acquire(sessionId: string, paths: string[]): { ok: boolean; conflict?: string } {
+		const normalized = paths.map((p) => path.resolve(p));
+		for (const p of normalized) {
+			const existing = this.locks.get(p);
+			if (existing && existing.sessionId !== sessionId) {
+				return { ok: false, conflict: p };
 			}
 		}
-		if (conflicts.length) return { ok: false, conflicts };
-		const acquiredAt = Date.now();
-		for (const p of paths) this.locks.set(p, { sessionId, acquiredAt });
-		return { ok: true, paths };
+		for (const p of normalized) {
+			this.locks.set(p, { sessionId, acquiredAt: Date.now() });
+		}
+		return { ok: true };
 	}
 
-	release(sessionId: string, rawPaths?: string[]) {
-		const wanted = rawPaths?.length ? new Set(rawPaths) : null;
-		const released = [];
-		for (const [p, info] of this.locks.entries()) {
-			if (info.sessionId === sessionId && (!wanted || wanted.has(p))) {
-				this.locks.delete(p);
-				released.push(p);
+	release(sessionId: string, paths?: string[]): void {
+		if (paths) {
+			for (const p of paths.map((x) => path.resolve(x))) {
+				const cur = this.locks.get(p);
+				if (cur && cur.sessionId === sessionId) this.locks.delete(p);
+			}
+		} else {
+			for (const [p, cur] of [...this.locks.entries()]) {
+				if (cur.sessionId === sessionId) this.locks.delete(p);
 			}
 		}
-		return released;
-	}
-
-	releaseByToolCall(toolCallId: string) {
-		const held = this.heldByToolCall.get(toolCallId);
-		if (!held) return [];
-		this.heldByToolCall.delete(toolCallId);
-		return this.release(held.sessionId, held.paths);
 	}
 }
 
@@ -448,108 +362,47 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 	sessionManager,
 	sessionStartEvent,
 }) => {
-	const host = getHost();
-	const activeRecord =
-		host.activeId !== PARENT_SESSION_ID ? host.get(host.activeId) : null;
+	const services = await createAgentSessionServices({ cwd, agentDir });
 	let inheritance = runtimeInheritanceBySessionManager.get(sessionManager);
-	// /new and /resume inside a child create a fresh SessionManager, so WeakMap
-	// inheritance from the original child manager is lost. Reattach it from the
-	// active child record before session construction, without mutating session log.
-	if (!inheritance && activeRecord?.kind === "child") {
-		inheritance =
-			activeRecord.inheritance ??
-			safeCollectRuntimeInheritance(activeRecord.context);
-		runtimeInheritanceBySessionManager.set(sessionManager, inheritance);
-		activeRecord.inheritance = inheritance;
+	let targetModel = inheritance?.model;
+
+	if (targetModel) {
+		const resolver = await loadModelResolver();
+		const availableModels = services.modelRegistry.getAll();
+		const found = availableModels.find((m: any) => sameModel(m, targetModel));
+		if (!found) {
+			const resolved = resolver.findDefaultModel(services.modelRegistry);
+			targetModel = resolved;
+		}
 	}
-	inheritance ??= {};
-	const inheritedSettings = createInheritedSettingsManager(
-		cwd,
-		agentDir,
-		inheritance,
-	);
-	const services = await createAgentSessionServices({
-		cwd,
-		agentDir,
-		authStorage: inheritance.authStorage,
-		settingsManager: inheritedSettings.settingsManager,
-	});
-	services.diagnostics.push(...inheritedSettings.diagnostics);
-	let sessionOptions: any = {};
-	try {
-		sessionOptions = await resolveChildSessionOptions(
-			services,
-			sessionManager,
-			inheritance,
-		);
-	} catch (error) {
-		services.diagnostics.push({
-			type: "warning",
-			message: `Failed to resolve inherited child session options: ${String(error)}`,
-		});
-	}
-	const result = await createAgentSessionFromServices({
+
+	const session = await createAgentSessionFromServices({
 		services,
 		sessionManager,
 		sessionStartEvent,
-		...sessionOptions,
+		model: targetModel,
+		thinkingLevel: inheritance?.thinkingLevel,
 	});
+
 	return {
-		...result,
+		session,
 		services,
 		diagnostics: services.diagnostics,
 	};
 };
 
-
-const branchCache = new Map<string, { branch: string; time: number }>();
-
-function getGitBranch(cwd: string): string {
-	if (!cwd) return "";
-	const cached = branchCache.get(cwd);
-	if (cached && Date.now() - cached.time < 10000) {
-		return cached.branch;
-	}
-	try {
-		const branch = execSync("git rev-parse --abbrev-ref HEAD", {
-			cwd,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-			timeout: 1000,
-		}).trim();
-		branchCache.set(cwd, { branch, time: Date.now() });
-		return branch;
-	} catch {
-		branchCache.set(cwd, { branch: "", time: Date.now() });
-		return "";
-	}
-}
-
-function getDefaultScope(): "current" | "all" {
-	try {
-		const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
-		if (fs.existsSync(settingsPath)) {
-			const raw = fs.readFileSync(settingsPath, "utf8");
-			const data = JSON.parse(raw);
-			if (data?.sessions?.defaultScope === "all" || data?.sessionsDefaultScope === "all") {
-				return "all";
-			}
-		}
-	} catch {}
-	return "current";
-}
-
 class PiSessionsHost {
 	activeId = PARENT_SESSION_ID;
+	inAgentView = false;
 	records = new Map<string, LiveSessionRecord>();
+	locks = new PathLockManager();
+	workingIndicator?: WorkingIndicatorOptions;
 	subscribers = new Set<() => void>();
-	locks = new LockManager();
+	private activationInProgress: Promise<void> | null = null;
+	private queuedActivation: string | null = null;
 	parentTui: any = null;
 	parentDone: (() => void) | null = null;
 	parentHandoffActive = false;
-	activationInProgress: Promise<void> | null = null;
-	queuedActivation: string | null = null;
-	workingIndicator: WorkingIndicatorOptions | undefined = undefined;
 
 	constructor() {
 		this.records.set(PARENT_SESSION_ID, {
@@ -561,21 +414,12 @@ class PiSessionsHost {
 			activity: "idle",
 			createdAt: Date.now(),
 			lastActivityAt: Date.now(),
-			status: "parent",
-			pid: process.pid,
 		});
 	}
 
-	get(id: string): LiveSessionRecord | undefined {
-		return (
-			this.records.get(id) ||
-			[...this.records.values()].find((r) => r.name === id)
-		);
-	}
-
-	subscribe(listener: () => void): () => void {
-		this.subscribers.add(listener);
-		return () => this.subscribers.delete(listener);
+	subscribe(fn: () => void): () => void {
+		this.subscribers.add(fn);
+		return () => this.subscribers.delete(fn);
 	}
 
 	notify(): void {
@@ -584,6 +428,15 @@ class PiSessionsHost {
 				listener();
 			} catch {}
 		}
+	}
+
+	get(idOrName: string): LiveSessionRecord | undefined {
+		if (this.records.has(idOrName)) return this.records.get(idOrName);
+		for (const r of this.records.values()) {
+			if (r.name === idOrName) return r;
+			if (r.sessionFile === idOrName) return r;
+		}
+		return undefined;
 	}
 
 	publicSession(record: LiveSessionRecord): any {
@@ -608,148 +461,6 @@ class PiSessionsHost {
 		};
 	}
 
-	
-	pinnedSessionIds = new Set<string>();
-
-	togglePin(idOrPath: string): void {
-		if (this.pinnedSessionIds.has(idOrPath)) {
-			this.pinnedSessionIds.delete(idOrPath);
-		} else {
-			this.pinnedSessionIds.add(idOrPath);
-		}
-		this.notify();
-	}
-
-	async renameSession(idOrPath: string, newName: string): Promise<void> {
-		const trimmed = (newName || "").trim();
-		if (!trimmed) return;
-		const live = this.get(idOrPath);
-		if (live) {
-			live.name = trimmed;
-			if (live.sessionFile && fs.existsSync(live.sessionFile)) {
-				try {
-					const sm = SessionManager.open(live.sessionFile);
-					sm.appendSessionInfo(trimmed);
-				} catch {}
-			}
-		} else if (fs.existsSync(idOrPath)) {
-			try {
-				const sm = SessionManager.open(idOrPath);
-				sm.appendSessionInfo(trimmed);
-			} catch {}
-		}
-		this.notify();
-	}
-
-	async dispatchChildWithPrompt(
-		ctx: CommandContext,
-		promptText: string,
-		cwd?: string,
-	): Promise<LiveSessionRecord> {
-		const targetCwd = cwd || ctx.cwd || process.cwd();
-		const child = await this.createChildFromContext(ctx, targetCwd);
-		child.activity = "working";
-		child.transcript = promptText;
-		this.notify();
-
-		try {
-			child.runtime?.session?.subscribe?.((event: any) => {
-				if (event.type === "agent_start" || event.type === "turn_start") {
-					child.activity = "working";
-					child.lastActivityAt = Date.now();
-					this.notify();
-				} else if (event.type === "agent_end") {
-					child.activity = "idle";
-					child.lastActivityAt = Date.now();
-					this.notify();
-				} else if (event.type === "tool_execution_start") {
-					child.transcript = `Running ${event.toolName}...`;
-					this.notify();
-				}
-			});
-		} catch {}
-
-		// Execute prompt in background
-		child.runPromise = (async () => {
-			try {
-				await child.runtime.session.prompt(promptText);
-			} catch (err: any) {
-				child.error = String(err?.message || err);
-			} finally {
-				child.activity = "idle";
-				child.transcript = resolveTranscriptName(child.name, child.sessionFile) || promptText;
-				this.notify();
-			}
-		})();
-
-		return child;
-	}
-
-	async listUnifiedSessions(
-		scope: "current" | "all",
-		currentCwd: string,
-	): Promise<any[]> {
-		const liveRecords = this.listLive();
-		const liveFiles = new Set<string>();
-		const result: any[] = [];
-
-		for (const r of liveRecords) {
-			if (r.sessionFile) liveFiles.add(r.sessionFile);
-			if (scope === "current" && r.cwd && path.resolve(r.cwd) !== path.resolve(currentCwd)) {
-				continue;
-			}
-			const isCurrent =
-				r.id === this.activeId ||
-				(r.id === PARENT_SESSION_ID && (!this.activeId || this.activeId === PARENT_SESSION_ID));
-			
-			const state = r.activity === "working" ? "working" : (isCurrent || r.activity === "waiting" ? "needs_input" : "completed");
-			
-			result.push({
-				id: r.id,
-				name: r.id === PARENT_SESSION_ID ? "current session" : (r.name || "session"),
-				cwd: r.cwd,
-				branch: getGitBranch(r.cwd),
-				state,
-				agentStatus: r.activity || "idle",
-				summary: r.transcript || resolveTranscriptName(r.name, r.sessionFile) || r.name,
-				modified: new Date(r.lastActivityAt || r.createdAt),
-				isLive: true,
-				isCurrent,
-				sessionFile: r.sessionFile,
-				pinned: this.pinnedSessionIds.has(r.id) || (r.sessionFile ? this.pinnedSessionIds.has(r.sessionFile) : false),
-			});
-		}
-
-		// Load saved sessions from disk
-		try {
-			const savedSessions = scope === "current"
-				? await SessionManager.list(currentCwd)
-				: await SessionManager.listAll();
-
-			for (const s of savedSessions) {
-				if (s.path && liveFiles.has(s.path)) {
-					continue;
-				}
-				result.push({
-					id: s.path,
-					name: s.name || "General assistance",
-					cwd: s.cwd || currentCwd,
-					branch: getGitBranch(s.cwd || currentCwd),
-					state: "completed",
-					agentStatus: "idle",
-					summary: s.firstMessage || s.name || "No summary",
-					modified: s.modified ? new Date(s.modified) : new Date(s.created || Date.now()),
-					isLive: false,
-					isCurrent: false,
-					sessionFile: s.path,
-					pinned: this.pinnedSessionIds.has(s.path),
-				});
-			}
-		} catch {}
-
-		return result;
-	}
-
 	listLive(): LiveSessionRecord[] {
 		const parent = this.records.get(PARENT_SESSION_ID);
 		const children = [...this.records.values()].filter(
@@ -771,70 +482,227 @@ class PiSessionsHost {
 		);
 		record.lastActivityAt = Date.now();
 		if (this.activeId === PARENT_SESSION_ID) record.state = "active";
+		
+		// Ensure in persistent registry
+		if (record.sessionFile) {
+			this.persistSessionRecord(record);
+		}
 		this.notify();
 	}
 
-	private updateChildFromContext(
-		child: LiveSessionRecord,
-		ctx: CommandContext,
-	): LiveSessionRecord {
-		child.context = ctx;
-		child.cwd = ctx.cwd || child.cwd;
-		child.sessionManager = ctx.sessionManager || child.sessionManager;
-		child.sessionId = ctx.sessionManager?.getSessionId?.() || child.sessionId;
-		child.sessionFile =
-			ctx.sessionManager?.getSessionFile?.() || child.sessionFile;
-		child.transcript = resolveTranscriptName(
-			ctx.sessionManager?.getSessionName?.(),
-			child.sessionFile,
+	private persistSessionRecord(record: LiveSessionRecord): void {
+		if (!record.sessionFile) return;
+		const registry = loadMultiplexRegistry();
+		const existingIdx = registry.findIndex(
+			(s) => s.sessionFile === record.sessionFile || s.id === record.id,
 		);
-		child.lastActivityAt = Date.now();
-		this.notify();
-		return child;
+		const entry: StoredMultiplexSession = {
+			id: record.id,
+			sessionFile: record.sessionFile,
+			cwd: record.cwd,
+			name: record.id === PARENT_SESSION_ID ? "current session" : (record.name || "session"),
+			pinned: existingIdx >= 0 ? registry[existingIdx].pinned : false,
+			createdAt: record.createdAt || Date.now(),
+			lastActivityAt: record.lastActivityAt || Date.now(),
+		};
+		if (existingIdx >= 0) {
+			registry[existingIdx] = { ...registry[existingIdx], ...entry };
+		} else {
+			registry.unshift(entry);
+		}
+		saveMultiplexRegistry(registry);
 	}
 
 	bindSessionContext(ctx: CommandContext): LiveSessionRecord {
-		const sessionId = ctx.sessionManager?.getSessionId?.();
-		const sessionFile = ctx.sessionManager?.getSessionFile?.();
-		const child = [...this.records.values()].find(
-			(r) =>
-				r.kind === "child" &&
-				((sessionId && r.sessionId === sessionId) ||
-					(sessionFile && r.sessionFile === sessionFile)),
+		const liveChild = [...this.records.values()].find(
+			(r) => r.kind === "child" && r.mode === (ctx as any).mode,
 		);
-		if (child) return this.updateChildFromContext(child, ctx);
-
-		const parent = this.records.get(PARENT_SESSION_ID)!;
-		const isParentContext =
-			(sessionId && parent.sessionId === sessionId) ||
-			(sessionFile && parent.sessionFile === sessionFile);
-		if (isParentContext) {
-			this.registerParent(ctx);
-			return parent;
+		if (liveChild) {
+			liveChild.context = ctx;
+			liveChild.cwd = ctx.cwd || liveChild.cwd;
+			return liveChild;
 		}
-
-		// /new or /resume inside the active child changes session id/file before we
-		// can match by identity. Route that replacement to the active child, but only
-		// after ruling out the parent context above.
-		const activeChild =
-			this.activeId !== PARENT_SESSION_ID ? this.get(this.activeId) : null;
-		if (activeChild?.kind === "child") {
-			return this.updateChildFromContext(activeChild, ctx);
-		}
-
 		this.registerParent(ctx);
-		return parent;
+		return this.records.get(PARENT_SESSION_ID)!;
 	}
 
-	updateActivity(ctx: CommandContext, activity: Activity): void {
+	updateActivity(ctx: CommandContext, activity: Activity, status?: string): void {
 		const record = this.bindSessionContext(ctx);
 		record.activity = activity;
+		if (status !== undefined) record.status = status;
 		record.lastActivityAt = Date.now();
 		this.notify();
 	}
 
-	currentContextId(ctx: CommandContext): string {
-		return this.bindSessionContext(ctx).id;
+	togglePin(idOrPath: string): void {
+		const registry = loadMultiplexRegistry();
+		const entry = registry.find((s) => s.id === idOrPath || s.sessionFile === idOrPath);
+		if (entry) {
+			entry.pinned = !entry.pinned;
+			saveMultiplexRegistry(registry);
+		}
+		this.notify();
+	}
+
+	async renameSession(idOrPath: string, newName: string): Promise<void> {
+		const trimmed = (newName || "").trim();
+		if (!trimmed) return;
+		const registry = loadMultiplexRegistry();
+		const entry = registry.find((s) => s.id === idOrPath || s.sessionFile === idOrPath);
+		if (entry) {
+			entry.name = trimmed;
+			saveMultiplexRegistry(registry);
+		}
+		const live = this.get(idOrPath);
+		if (live) {
+			live.name = trimmed;
+			if (live.sessionFile && fs.existsSync(live.sessionFile)) {
+				try {
+					const sm = SessionManager.open(live.sessionFile);
+					sm.appendSessionInfo(trimmed);
+				} catch {}
+			}
+		} else if (fs.existsSync(idOrPath)) {
+			try {
+				const sm = SessionManager.open(idOrPath);
+				sm.appendSessionInfo(trimmed);
+			} catch {}
+		}
+		this.notify();
+	}
+
+	async removeMultiplexedSession(idOrPath: string): Promise<void> {
+		const live = this.get(idOrPath);
+		if (live && live.kind === "child") {
+			await this.stopChild(live.id);
+		}
+		const registry = loadMultiplexRegistry();
+		const filtered = registry.filter((s) => s.id !== idOrPath && s.sessionFile !== idOrPath);
+		saveMultiplexRegistry(filtered);
+		this.notify();
+	}
+
+	registerSessionFile(sessionFile: string, cwd: string, name?: string): void {
+		const registry = loadMultiplexRegistry();
+		if (registry.some((s) => s.sessionFile === sessionFile)) return;
+		registry.unshift({
+			id: `sess-${Date.now().toString(36)}`,
+			sessionFile,
+			cwd,
+			name: name || readFirstMessage(sessionFile) || path.basename(cwd),
+			pinned: false,
+			createdAt: Date.now(),
+			lastActivityAt: Date.now(),
+		});
+		saveMultiplexRegistry(registry);
+	}
+
+	async dispatchChildWithPrompt(
+		ctx: CommandContext,
+		promptText: string,
+		cwd?: string,
+	): Promise<LiveSessionRecord> {
+		const targetCwd = cwd || ctx.cwd || process.cwd();
+		const child = await this.createChildFromContext(ctx, targetCwd);
+		child.activity = "working";
+		child.transcript = promptText;
+		this.persistSessionRecord(child);
+		this.notify();
+
+		try {
+			child.runtime?.session?.subscribe?.((event: any) => {
+				if (event.type === "agent_start" || event.type === "turn_start") {
+					child.activity = "working";
+					child.lastActivityAt = Date.now();
+					this.notify();
+				} else if (event.type === "agent_end") {
+					child.activity = "idle";
+					child.lastActivityAt = Date.now();
+					this.notify();
+				} else if (event.type === "tool_execution_start") {
+					child.transcript = `Running ${event.toolName}...`;
+					this.notify();
+				}
+			});
+		} catch {}
+
+		child.runPromise = (async () => {
+			try {
+				await child.runtime.session.prompt(promptText);
+			} catch (err: any) {
+				child.error = String(err?.message || err);
+			} finally {
+				child.activity = "idle";
+				child.transcript = resolveTranscriptName(child.name, child.sessionFile) || promptText;
+				this.persistSessionRecord(child);
+				this.notify();
+			}
+		})();
+
+		return child;
+	}
+
+	async listMultiplexedSessions(
+		_orgMode: "state" | "directory",
+		currentCwd: string,
+	): Promise<any[]> {
+		const registry = loadMultiplexRegistry();
+		const parentRecord = this.records.get(PARENT_SESSION_ID);
+		if (parentRecord?.sessionFile) {
+			this.persistSessionRecord(parentRecord);
+		}
+
+		// Reload registry to reflect current state
+		const currentRegistry = loadMultiplexRegistry();
+		const result: any[] = [];
+		const seenFiles = new Set<string>();
+
+		for (const entry of currentRegistry) {
+			if (seenFiles.has(entry.sessionFile)) continue;
+			seenFiles.add(entry.sessionFile);
+
+			const live = [...this.records.values()].find(
+				(r) => r.sessionFile === entry.sessionFile || r.id === entry.id,
+			);
+
+			const isCurrent =
+				live &&
+				(live.id === this.activeId ||
+					(live.id === PARENT_SESSION_ID && (!this.activeId || this.activeId === PARENT_SESSION_ID)));
+
+			let state: "needs_input" | "working" | "completed" = "completed";
+			let agentStatus = "idle";
+			let summary = entry.name;
+
+			if (live) {
+				agentStatus = live.activity || "idle";
+				if (live.activity === "working") {
+					state = "working";
+				} else if (isCurrent || live.activity === "waiting") {
+					state = "needs_input";
+				}
+				summary = live.transcript || resolveTranscriptName(live.name, live.sessionFile) || entry.name;
+			} else if (entry.sessionFile && fs.existsSync(entry.sessionFile)) {
+				summary = readFirstMessage(entry.sessionFile) || entry.name;
+			}
+
+			result.push({
+				id: live?.id || entry.id || entry.sessionFile,
+				name: isCurrent ? "current session" : (entry.name || "session"),
+				cwd: entry.cwd || currentCwd,
+				branch: getGitBranch(entry.cwd || currentCwd),
+				state,
+				agentStatus,
+				summary,
+				modified: new Date(entry.lastActivityAt || entry.createdAt || Date.now()),
+				isLive: Boolean(live),
+				isCurrent: Boolean(isCurrent),
+				sessionFile: entry.sessionFile,
+				pinned: Boolean(entry.pinned),
+			});
+		}
+
+		return result;
 	}
 
 	async createChildFromContext(
@@ -874,12 +742,14 @@ class PiSessionsHost {
 				path.basename(cwd) ||
 				sessionManager.getSessionId?.(),
 		);
-		return await this.createRecordForSessionManager({
+		const child = await this.createRecordForSessionManager({
 			name,
 			cwd,
 			sessionManager,
 			inheritance: safeCollectRuntimeInheritance(ctx),
 		});
+		this.persistSessionRecord(child);
+		return child;
 	}
 
 	private async createRecordForSessionManager(opts: {
@@ -945,8 +815,7 @@ class PiSessionsHost {
 
 	async stopChild(nameOrId: string): Promise<void> {
 		const record = this.get(nameOrId);
-		if (!record || record.kind !== "child")
-			throw new Error("session not found");
+		if (!record || record.kind !== "child") return;
 		const wasActive = this.activeId === record.id;
 		record.expectedStop = true;
 		record.state = "stopped";
@@ -1039,8 +908,8 @@ class PiSessionsHost {
 		ctx: CommandContext,
 		targetId: string,
 	): Promise<void> {
-		const current = this.currentContextId(ctx);
-		if (current === PARENT_SESSION_ID && targetId !== PARENT_SESSION_ID) {
+		const current = this.records.get(PARENT_SESSION_ID);
+		if (current?.id === this.activeId && targetId !== PARENT_SESSION_ID) {
 			await this.enterFromParent(ctx, targetId);
 		} else {
 			await this.activate(targetId);
@@ -1092,7 +961,10 @@ function installWidget(ctx: CommandContext, host: PiSessionsHost): void {
 			() => host.workingIndicator,
 		);
 		return {
-			render: (width: number) => widget.render(width),
+			render: (width: number) => {
+				if (host.inAgentView) return [];
+				return widget.render(width);
+			},
 			invalidate: () => widget.invalidate(),
 			dispose: () => {
 				unsubscribe();
@@ -1102,64 +974,87 @@ function installWidget(ctx: CommandContext, host: PiSessionsHost): void {
 	});
 }
 
-async function getResumeSessions(): Promise<any[]> {
-	const sessions = await SessionManager.listAll();
-	return sessions.sort(
-		(a: any, b: any) => Number(b.modified) - Number(a.modified),
-	);
-}
-
 async function openSessions(
 	ctx: CommandContext,
 	host: PiSessionsHost,
 ): Promise<void> {
 	let targetToActivate: string | null = null;
 	let targetToKill: string | null = null;
-	await showSessionsView(ctx, {
-		getSessions: async (scope: "current" | "all") =>
-			host.listUnifiedSessions(scope, ctx.cwd || process.cwd()),
-		getDefaultScope: () => getDefaultScope(),
-		getAttached: () => host.activeId,
-		getCwd: () => ctx.cwd || process.cwd(),
-		switchTo: async (id: string) => {
-			const target = host.get(id === "parent" ? PARENT_SESSION_ID : id);
-			if (!target) {
-				// Might be a saved session path
-				const child = await host.openSavedSessionAsLive(id, undefined, ctx);
+
+	host.inAgentView = true;
+	host.notify();
+
+	// Hide main Pi footer while in Agent View
+	ctx.ui.setFooter?.(() => ({
+		render: () => [],
+		invalidate: () => {},
+		dispose: () => {},
+	}));
+
+	try {
+		await showSessionsView(ctx, {
+			getSessions: async (orgMode: "state" | "directory") =>
+				host.listMultiplexedSessions(orgMode, ctx.cwd || process.cwd()),
+			getResumeSessions: async () => {
+				const sessions = await SessionManager.listAll();
+				return sessions.sort(
+					(a: any, b: any) => Number(b.modified) - Number(a.modified),
+				);
+			},
+			getAttached: () => host.activeId,
+			getCwd: () => ctx.cwd || process.cwd(),
+			switchTo: async (id: string) => {
+				const target = host.get(id === "parent" ? PARENT_SESSION_ID : id);
+				if (!target) {
+					const child = await host.openSavedSessionAsLive(id, undefined, ctx);
+					targetToActivate = child.id;
+					return;
+				}
+				targetToActivate = target.id;
+			},
+			dispatchSession: async (prompt: string, cwd?: string) => {
+				const child = await host.dispatchChildWithPrompt(
+					ctx,
+					prompt,
+					cwd || ctx.cwd || process.cwd(),
+				);
+				return child.id;
+			},
+			retrieveSession: async (sessionPath: string) => {
+				host.registerSessionFile(sessionPath, ctx.cwd || process.cwd());
+				host.notify();
+			},
+			resumeSession: async (sessionPath: string) => {
+				const child = await host.openSavedSessionAsLive(
+					sessionPath,
+					undefined,
+					ctx,
+				);
 				targetToActivate = child.id;
-				return;
-			}
-			targetToActivate = target.id;
-		},
-		dispatchSession: async (prompt: string, cwd?: string) => {
-			const child = await host.dispatchChildWithPrompt(
-				ctx,
-				prompt,
-				cwd || ctx.cwd || process.cwd(),
-			);
-			return child.id;
-		},
-		resumeSession: async (sessionPath: string) => {
-			const child = await host.openSavedSessionAsLive(
-				sessionPath,
-				undefined,
-				ctx,
-			);
-			targetToActivate = child.id;
-			return child.id;
-		},
-		renameSession: async (idOrPath: string, newName: string) => {
-			await host.renameSession(idOrPath, newName);
-		},
-		togglePinSession: (idOrPath: string) => {
-			host.togglePin(idOrPath);
-		},
-		killSession: async (id: string) => {
-			targetToKill = id;
-		},
-		notify: (message: string, type?: "info" | "warning" | "error") =>
-			ctx.ui.notify(message, type || "info"),
-	});
+				return child.id;
+			},
+			renameSession: async (idOrPath: string, newName: string) => {
+				await host.renameSession(idOrPath, newName);
+			},
+			togglePinSession: (idOrPath: string) => {
+				host.togglePin(idOrPath);
+			},
+			removeSession: async (idOrPath: string) => {
+				await host.removeMultiplexedSession(idOrPath);
+			},
+			killSession: async (id: string) => {
+				targetToKill = id;
+			},
+			notify: (message: string, type?: "info" | "warning" | "error") =>
+				ctx.ui.notify(message, type || "info"),
+		});
+	} finally {
+		host.inAgentView = false;
+		host.notify();
+		// Restore Pi's default footer on exit
+		ctx.ui.setFooter?.(undefined);
+	}
+
 	if (targetToKill) {
 		await host.stopChild(targetToKill);
 		return;
@@ -1172,17 +1067,47 @@ export default function (pi: ExtensionAPI) {
 	const host = getHost();
 	patchInteractiveModeWorkingIndicator(host);
 
+	let activeUiPromptCount = 0;
+
 	pi.registerCommand("sessions", {
 		description: "Open the pi-sessions switcher",
 		handler: async (_args: string, ctx: CommandContext) =>
 			openSessions(ctx, host),
 	});
 
+	// Track blocking extension prompts (e.g. Guardrails)
+	pi.on("ui_prompt_start", (event: any, ctx: CommandContext) => {
+		activeUiPromptCount++;
+		host.updateActivity(ctx, "waiting", event?.title || "Waiting for input");
+	});
+
+	pi.on("ui_prompt_end", (_event: any, ctx: CommandContext) => {
+		activeUiPromptCount = Math.max(0, activeUiPromptCount - 1);
+		host.updateActivity(ctx, "idle");
+	});
+
 	pi.on("session_start", async (_event: any, ctx: CommandContext) => {
 		if (ctx.mode !== "tui") return;
+		host.bindSessionContext(ctx);
+		installWidget(ctx, host);
+
 		ctx.ui.onTerminalInput?.((data: string) => {
 			if (data === "\x1b[D") { // Left Arrow
 				try {
+					// 1. Never activate if an extension prompt/dialog is open
+					if (activeUiPromptCount > 0) return;
+
+					// 2. Check if current InteractiveMode has a built-in or extension selector open
+					const currentRecord = host.get(host.activeId || PARENT_SESSION_ID);
+					const mode = currentRecord?.mode;
+					if (mode) {
+						if (mode.activeSelectorToken !== undefined) return;
+						if (mode.extensionSelector || mode.extensionInput || mode.extensionEditor) return;
+						const focused = mode.renderer?.getFocusedComponent?.();
+						if (focused && focused !== mode.editor && focused !== mode.defaultEditor) return;
+					}
+
+					// 3. Only activate when prompt is completely empty
 					if (!ctx.ui.getEditorText().trim()) {
 						void openSessions(ctx, host);
 					}
@@ -1194,11 +1119,6 @@ export default function (pi: ExtensionAPI) {
 	pi.registerShortcut("ctrl+r", {
 		description: "Open sessions switcher",
 		handler: async (ctx: CommandContext) => openSessions(ctx, host),
-	});
-
-	pi.on("session_start", (_event: any, ctx: CommandContext) => {
-		host.bindSessionContext(ctx);
-		installWidget(ctx, host);
 	});
 
 	pi.on("agent_start", (_event: any, ctx: CommandContext) => {
@@ -1228,39 +1148,21 @@ export default function (pi: ExtensionAPI) {
 					reason: "Denied by pi-sessions permission routing",
 				};
 		}
-		const paths = inferToolPaths(event.toolName, event.input);
-		if (!paths.length) return undefined;
-		const result = host.locks.acquire(record.id, paths, ctx.cwd || record.cwd);
-		if (!result.ok) {
-			return {
-				block: true,
-				reason: `pi-sessions path lock conflict: ${JSON.stringify(result.conflicts)}`,
-			};
+		if (["edit", "write"].includes(event.toolName) && event.input?.path) {
+			const lock = host.locks.acquire(record.id, [event.input.path]);
+			if (!lock.ok) {
+				return {
+					block: true,
+					reason: `Path conflict: ${lock.conflict} locked by another session`,
+				};
+			}
 		}
-		host.locks.heldByToolCall.set(event.toolCallId, {
-			sessionId: record.id,
-			paths: result.paths,
-		});
-		return undefined;
 	});
 
-	pi.on("tool_result", async (event: any, ctx: CommandContext) => {
-		host.locks.releaseByToolCall(event.toolCallId);
+	pi.on("tool_execution_end", (event: any, ctx: CommandContext) => {
 		const record = host.bindSessionContext(ctx);
-		if (record.activity === "waiting") {
-			record.activity = "working";
-			record.lastActivityAt = Date.now();
-			host.notify();
+		if (["edit", "write"].includes(event.toolName) && event.input?.path) {
+			host.locks.release(record.id, [event.input.path]);
 		}
-		return undefined;
-	});
-
-	pi.on("session_shutdown", (_event: any, ctx: CommandContext) => {
-		const record = host.bindSessionContext(ctx);
-		host.locks.release(record.id);
-		try {
-			ctx.ui.setWidget("pi-sessions", undefined);
-		} catch {}
-		host.notify();
 	});
 }

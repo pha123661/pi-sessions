@@ -1,0 +1,186 @@
+const { createJiti } = require("/Users/oscarliswei/.n/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/jiti");
+const jiti = createJiti(process.cwd());
+const ui = jiti("./ui.ts");
+
+// Mock Theme
+const mockTheme = {
+	bold: (s) => `\x1b[1m${s}\x1b[22m`,
+	fg: (color, s) => s,
+	bg: (color, s) => s,
+};
+
+let pinnedIds = new Set(["sess-2"]); // sess-2 pinned
+let removedId = null;
+
+// Mock Actions
+const mockActions = {
+	getSessions: async (orgMode) => {
+		return [
+			{
+				id: "sess-1",
+				name: "current session",
+				cwd: "/Users/oscarliswei/Projects/pi-sessions",
+				branch: "main",
+				state: "needs_input",
+				summary: "Refactoring the session viewer",
+				modified: new Date(Date.now() - 14000),
+				isLive: true,
+				isCurrent: true,
+				pinned: pinnedIds.has("sess-1"),
+			},
+			{
+				id: "sess-2",
+				name: "Pinned Task",
+				cwd: "/Users/oscarliswei/Projects/homepage",
+				branch: "feat/pinned",
+				state: "completed",
+				summary: "Pinned session summary",
+				modified: new Date(Date.now() - 100000),
+				isLive: false,
+				isCurrent: false,
+				pinned: pinnedIds.has("sess-2"),
+			},
+			{
+				id: "sess-3",
+				name: "Completed Task",
+				cwd: "/Users/oscarliswei/Projects/pi-sessions",
+				branch: "main",
+				state: "completed",
+				summary: "Finished previous job",
+				modified: new Date(Date.now() - 200000),
+				isLive: false,
+				isCurrent: false,
+				pinned: pinnedIds.has("sess-3"),
+			},
+		];
+	},
+	getResumeSessions: async () => [],
+	getAttached: () => "sess-1",
+	getCwd: () => "/Users/oscarliswei/Projects/pi-sessions",
+	switchTo: async (id) => console.log("switchTo:", id),
+	dispatchSession: async (prompt) => {
+		console.log("dispatchSession:", prompt);
+		return "sess-new";
+	},
+	retrieveSession: async (sessionPath) => console.log("retrieveSession:", sessionPath),
+	resumeSession: async (path) => console.log("resumeSession:", path),
+	renameSession: async (id, name) => console.log("renameSession:", id, name),
+	togglePinSession: (id) => {
+		if (pinnedIds.has(id)) pinnedIds.delete(id);
+		else pinnedIds.add(id);
+	},
+	removeSession: async (id) => {
+		removedId = id;
+	},
+	killSession: async (id) => console.log("killSession:", id),
+	notify: (msg, type) => console.log(`notify (${type}):`, msg),
+};
+
+(async () => {
+	let capturedView = null;
+	const mockCtx = {
+		ui: {
+			custom: async (factory) => {
+				capturedView = factory(
+					{ requestRender: () => {} },
+					mockTheme,
+					{},
+					() => console.log("done() called"),
+				);
+			},
+		},
+	};
+
+	await ui.showSessionsView(mockCtx, mockActions);
+	await new Promise((r) => setTimeout(r, 60));
+
+	console.log("=== 1. Testing Pinned Section in State View ===");
+	const linesState = capturedView.render(110);
+	const textState = linesState.join("\n");
+	console.log(textState);
+	if (!textState.includes("Pinned")) {
+		throw new Error("Missing 'Pinned' section in State view");
+	}
+	if (!textState.includes("Pinned Task")) {
+		throw new Error("Missing pinned item in Pinned section");
+	}
+	console.log("[PASS] Pinned section rendered at top of State View.");
+
+	console.log("=== 2. Testing Pinned Section in Directory View (Ctrl+S) ===");
+	capturedView.handleInput("\x13"); // Ctrl+S to switch view
+	await new Promise((r) => setTimeout(r, 60));
+	const linesDir = capturedView.render(110);
+	const textDir = linesDir.join("\n");
+	console.log(textDir);
+	if (!textDir.includes("Group by Directory")) {
+		throw new Error("View mode label does not show 'Group by Directory'");
+	}
+	if (!textDir.includes("Pinned")) {
+		throw new Error("Missing 'Pinned' section in Directory view");
+	}
+	console.log("[PASS] Pinned section also rendered at top of Directory View.");
+
+	// Switch back to State view
+	capturedView.handleInput("\x13"); // Ctrl+S
+	await new Promise((r) => setTimeout(r, 60));
+
+	console.log("=== 3. Testing '?' Short-cut Toggling vs Typing '?' ===");
+	// When empty, ? toggles shortcuts
+	if (textState.includes("ctrl+s to switch views")) {
+		throw new Error("Shortcuts should be collapsed by default");
+	}
+	capturedView.handleInput("?"); // Press ? on empty input
+	const linesExpanded = capturedView.render(110);
+	if (!linesExpanded.join("\n").includes("ctrl+s to switch views")) {
+		throw new Error("Pressing '?' on empty input failed to expand shortcuts");
+	}
+	console.log("[PASS] Pressing '?' on empty prompt expands shortcuts footer.");
+
+	capturedView.handleInput("?"); // Press ? again to collapse
+	const linesCollapsed = capturedView.render(110);
+	if (linesCollapsed.join("\n").includes("ctrl+s to switch views")) {
+		throw new Error("Pressing '?' on empty input failed to collapse shortcuts");
+	}
+	console.log("[PASS] Pressing '?' on empty prompt collapses shortcuts footer.");
+
+	// Now type a prompt containing '?'
+	capturedView.handleInput("W");
+	capturedView.handleInput("h");
+	capturedView.handleInput("y");
+	capturedView.handleInput("?"); // Typing '?' as part of task!
+	const linesTyped = capturedView.render(110);
+	if (!linesTyped.join("\n").includes("❯ Why?")) {
+		throw new Error("Typing '?' when input is not empty should NOT toggle shortcuts, but insert '?'");
+	}
+	console.log("[PASS] Typing '?' while writing prompt correctly inserts '?' without toggling footer!");
+
+	console.log("=== 4. Testing Multiline Input with Ctrl+J ===");
+	capturedView.handleInput("\x0a"); // Ctrl+J (newline)
+	capturedView.handleInput("Second line");
+	const linesMulti = capturedView.render(110);
+	const multiText = linesMulti.join("\n");
+	console.log("Multiline rendered prompt:\n" + multiText.slice(multiText.indexOf("❯ Why?")));
+	if (!multiText.includes("❯ Why?") || !multiText.includes("  Second line")) {
+		throw new Error("Multiline prompt failed to render both lines");
+	}
+	console.log("[PASS] Ctrl+J successfully inserted newline in multiline prompt.");
+
+	console.log("=== 5. Testing Esc clearing multiline prompt ===");
+	capturedView.handleInput("\x1b"); // Esc
+	const linesCleared = capturedView.render(110);
+	if (!linesCleared.join("\n").includes("describe a task for a new session")) {
+		throw new Error("Esc failed to clear prompt");
+	}
+	console.log("[PASS] Esc cleared the multiline prompt.");
+
+	console.log("=== 6. Testing Collapsible Section with Space / Enter ===");
+	// In linesCleared, navigate down to the 'Needs input' header or 'Completed' header
+	// Let's press down arrow and space to collapse
+	capturedView.handleInput(" "); // Toggle collapse on focused row
+	await new Promise((r) => setTimeout(r, 60));
+	console.log("[PASS] Space toggle collapse executed without error.");
+
+	capturedView.dispose();
+	console.log("=== ALL V3 BEHAVIOR & BUG FIX TESTS PASSED! ===");
+	process.exit(0);
+})();
