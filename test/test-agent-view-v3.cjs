@@ -173,12 +173,41 @@ const mockActions = {
 	}
 	console.log("[PASS] Esc cleared the multiline prompt.");
 
-	console.log("=== 6. Testing Collapsible Section with Space / Enter ===");
-	// In linesCleared, navigate down to the 'Needs input' header or 'Completed' header
-	// Let's press down arrow and space to collapse
-	capturedView.handleInput(" "); // Toggle collapse on focused row
-	await new Promise((r) => setTimeout(r, 60));
-	console.log("[PASS] Space toggle collapse executed without error.");
+	console.log("=== 6. Testing Collapsible Section Consistency ===");
+	// Row 0 is Pinned header (initially expanded)
+	const linesH1 = capturedView.render(110).join("\n");
+	if (!linesH1.includes("space to collapse")) {
+		throw new Error("Expanded header should show '(space to collapse)'");
+	}
+	console.log("[PASS] Expanded header displays '(space to collapse)'.");
+
+	// Press space to collapse
+	capturedView.handleInput(" ");
+	const linesH2 = capturedView.render(110).join("\n");
+	if (!linesH2.includes("space to expand")) {
+		throw new Error("Collapsed header should show '(space to expand)', got: " + linesH2);
+	}
+	console.log("[PASS] Collapsed header displays '(space to expand)'.");
+
+	// Press space again to expand back
+	capturedView.handleInput(" ");
+
+	console.log("=== 7. Testing Ctrl+X on Current Foreground Session ===");
+	// Navigate down to current session row (row 2 or 3)
+	// Let's find index of current session
+	while (true) {
+		const row = capturedView.getSelectedRow?.();
+		if (row && row.type === "session" && row.item.isCurrent) break;
+		capturedView.handleInput("\x1b[B"); // down arrow
+	}
+	// Press Ctrl+X on current foreground session
+	capturedView.handleInput("\x18"); // Ctrl+X
+	const warningRender = capturedView.render(110).join("\n");
+	console.log("View output after Ctrl+X:\n" + warningRender.slice(0, 300));
+	if (!warningRender.includes("Cannot remove current foreground session.")) {
+		throw new Error("Warning banner was not rendered inside Agent View on Ctrl+X!");
+	}
+	console.log("[PASS] In-view warning rendered directly inside Agent View on Ctrl+X!");
 
 	capturedView.dispose();
 	console.log("=== ALL V3 BEHAVIOR & BUG FIX TESTS PASSED! ===");

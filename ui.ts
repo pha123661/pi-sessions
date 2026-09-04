@@ -592,6 +592,8 @@ class SessionsView {
 	private resumePicker: ResumeSessionPicker | null = null;
 	private lastCtrlCTime = 0;
 	private timer: NodeJS.Timeout | null = null;
+	private inlineNotice: { text: string; type: "info" | "warning" | "error" } | null = null;
+	private noticeTimer: NodeJS.Timeout | null = null;
 
 	constructor(
 		private readonly theme: any,
@@ -738,7 +740,21 @@ class SessionsView {
 		if (this.closed) return;
 		this.closed = true;
 		if (this.timer) clearInterval(this.timer);
+		if (this.noticeTimer) clearTimeout(this.noticeTimer);
 		this.done();
+	}
+
+	notify(message: string, type: "info" | "warning" | "error" = "info"): void {
+		if (this.noticeTimer) {
+			clearTimeout(this.noticeTimer);
+			this.noticeTimer = null;
+		}
+		this.inlineNotice = { text: message, type };
+		this.requestRender();
+		this.noticeTimer = setTimeout(() => {
+			this.inlineNotice = null;
+			this.requestRender();
+		}, 3500);
 	}
 
 	private getSelectedRow(): SelectableRow | undefined {
@@ -798,7 +814,7 @@ class SessionsView {
 					this.taskPrompt.clear();
 					if (this.actions.dispatchSession) {
 						void this.actions.dispatchSession(taskText).then(() => {
-							this.actions.notify("Session dispatched in background", "info");
+							this.notify("Session dispatched in background", "info");
 							return this.refresh();
 						});
 					}
@@ -849,7 +865,7 @@ class SessionsView {
 		if (isCtrl(data, "s")) {
 			this.orgMode = this.orgMode === "state" ? "directory" : "state";
 			this.selected = 0;
-			this.actions.notify(
+			this.notify(
 				`Switched view: ${this.orgMode === "state" ? "Group by State" : "Group by Directory"}`,
 				"info",
 			);
@@ -883,7 +899,7 @@ class SessionsView {
 			const row = this.getSelectedRow();
 			if (row && row.type === "session") {
 				if (row.item.isCurrent) {
-					this.actions.notify("Cannot remove current foreground session.", "warning");
+					this.notify("Cannot remove current foreground session.", "warning");
 					return;
 				}
 				void this.actions.removeSession?.(row.item.id).then(() => this.refresh());
@@ -987,7 +1003,7 @@ class SessionsView {
 				this.close();
 			} else {
 				this.lastCtrlCTime = now;
-				this.actions.notify("Press Ctrl+C again to quit", "warning");
+				this.notify("Press Ctrl+C again to quit", "warning");
 			}
 			return;
 		}
@@ -1015,7 +1031,24 @@ class SessionsView {
 			"Your conversation moved to the background — enter opens it · esc returns to it · ctrl+c twice quits";
 		const viewModeLabel = this.orgMode === "state" ? "Group by State" : "Group by Directory";
 		lines.push(accent(banner) + dim(`  ·  [${viewModeLabel}]`));
-		lines.push("");
+
+		if (this.inlineNotice) {
+			const icon =
+				this.inlineNotice.type === "warning"
+					? "⚠ "
+					: this.inlineNotice.type === "error"
+						? "✖ "
+						: "ℹ ";
+			const color =
+				this.inlineNotice.type === "warning"
+					? "warning"
+					: this.inlineNotice.type === "error"
+						? "error"
+						: "accent";
+			lines.push(th.fg(color as any, `  ${icon}${this.inlineNotice.text}`));
+		} else {
+			lines.push("");
+		}
 
 		// 2. Render Selectable Rows (Headers & Session Rows)
 		for (let i = 0; i < this.selectableRows.length; i++) {
@@ -1026,7 +1059,7 @@ class SessionsView {
 				// Section header line
 				const marker = isSelected ? accent("› ") : "  ";
 				const collapseHint = isSelected
-					? dim(row.isCollapsed ? " (enter to expand)" : " (space to collapse)")
+					? dim(row.isCollapsed ? " (space to expand)" : " (space to collapse)")
 					: "";
 				const headerLine = `${marker}${bold(row.title)}${collapseHint}`;
 				lines.push(headerLine);
