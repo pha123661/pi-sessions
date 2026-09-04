@@ -107,7 +107,8 @@ function isAltDigit(data: string): number | null {
 
 function padVisible(text: string, width: number): string {
 	const truncated = truncateToWidth(text, width, "…");
-	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+	const padding = " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+	return truncateToWidth(truncated + padding, width);
 }
 
 function renderInputChild(input: Input, width: number): string {
@@ -123,7 +124,8 @@ function renderTaskInput(
 ): string {
 	input.focused = true;
 	const prompt = theme.fg("accent", "❯ ");
-	const availableWidth = Math.max(10, width - 2);
+	const promptWidth = visibleWidth(prompt);
+	const availableWidth = Math.max(10, width - promptWidth);
 	const rendered = input.render(availableWidth)[0] ?? "";
 	const content = rendered.startsWith("> ") ? rendered.slice(2) : rendered;
 
@@ -132,11 +134,14 @@ function renderTaskInput(
 		if (cursorEndIdx !== -1) {
 			const cursorPart = content.slice(0, cursorEndIdx + 5);
 			const phText = theme.fg("dim", ` ${placeholder}`);
-			const remainingWidth = Math.max(0, width - 2 - 1 - visibleWidth(placeholder));
-			return `${prompt}${cursorPart}${phText}${" ".repeat(remainingWidth)}`;
+			const combined = `${prompt}${cursorPart}${phText}`;
+			const pad = " ".repeat(Math.max(0, width - visibleWidth(combined)));
+			return truncateToWidth(`${combined}${pad}`, width);
 		}
 	}
-	return `${prompt}${content}`;
+	const fullLine = `${prompt}${content}`;
+	const pad = " ".repeat(Math.max(0, width - visibleWidth(fullLine)));
+	return truncateToWidth(`${fullLine}${pad}`, width);
 }
 
 function shortenPath(p: string): string {
@@ -444,7 +449,7 @@ class ResumeSessionPicker implements Component, Focusable {
 
 		lines.push(border("dim"));
 		lines.push(dim("  enter to retrieve into agent view · esc to cancel"));
-		return lines;
+		return lines.map((l) => truncateToWidth(l, width));
 	}
 
 	invalidate(): void {
@@ -1053,7 +1058,7 @@ class SessionsView {
 			lines.push(padVisible(dim(line2), width));
 		}
 
-		return lines;
+		return lines.map((l) => truncateToWidth(l, width));
 	}
 
 	invalidate(): void {
