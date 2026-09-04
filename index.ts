@@ -211,7 +211,14 @@ function loadMultiplexRegistry(): StoredMultiplexSession[] {
 	try {
 		if (fs.existsSync(REGISTRY_FILE)) {
 			const raw = fs.readFileSync(REGISTRY_FILE, "utf8");
-			return JSON.parse(raw).sessions || [];
+			const list: StoredMultiplexSession[] = JSON.parse(raw).sessions || [];
+			// Clean up any old entries where name was mistakenly saved as literal "current session"
+			for (const s of list) {
+				if (s.name === "current session" && s.sessionFile && fs.existsSync(s.sessionFile)) {
+					s.name = readFirstMessage(s.sessionFile) || path.basename(s.cwd) || "session";
+				}
+			}
+			return list;
 		}
 	} catch {}
 	return [];
@@ -366,13 +373,11 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 	let inheritance = runtimeInheritanceBySessionManager.get(sessionManager);
 	let targetModel = inheritance?.model;
 
-	if (targetModel) {
-		const resolver = await loadModelResolver();
-		const availableModels = services.modelRegistry.getAll();
+	if (targetModel && services.modelRuntime) {
+		const availableModels = services.modelRuntime.getModels?.() || [];
 		const found = availableModels.find((m: any) => sameModel(m, targetModel));
 		if (!found) {
-			const resolved = resolver.findDefaultModel(services.modelRegistry);
-			targetModel = resolved;
+			targetModel = undefined;
 		}
 	}
 
@@ -490,19 +495,32 @@ class PiSessionsHost {
 		this.notify();
 	}
 
+	getActiveSessionFile(): string | undefined {
+		const activeRecord = this.get(this.activeId);
+		return activeRecord?.sessionFile || this.records.get(PARENT_SESSION_ID)?.sessionFile;
+	}
+
 	private persistSessionRecord(record: LiveSessionRecord): void {
 		if (!record.sessionFile) return;
 		const registry = loadMultiplexRegistry();
 		const existingIdx = registry.findIndex(
-			(s) => s.sessionFile === record.sessionFile || s.id === record.id,
+			(s) => s.sessionFile === record.sessionFile,
 		);
+		const realName =
+			(record.id !== PARENT_SESSION_ID ? record.name : undefined) ||
+			record.context?.sessionManager?.getSessionName?.() ||
+			record.sessionManager?.getSessionName?.() ||
+			readFirstMessage(record.sessionFile) ||
+			path.basename(record.cwd) ||
+			"session";
+
 		const entry: StoredMultiplexSession = {
-			id: record.id,
+			id: record.id !== PARENT_SESSION_ID ? record.id : `sess-${Date.now().toString(36)}`,
 			sessionFile: record.sessionFile,
 			cwd: record.cwd,
-			name: record.id === PARENT_SESSION_ID ? "current session" : (record.name || "session"),
+			name: realName,
 			pinned: existingIdx >= 0 ? registry[existingIdx].pinned : false,
-			createdAt: record.createdAt || Date.now(),
+			createdAt: record.createdAt || (existingIdx >= 0 ? registry[existingIdx].createdAt : Date.now()),
 			lastActivityAt: record.lastActivityAt || Date.now(),
 		};
 		if (existingIdx >= 0) {
@@ -585,11 +603,16 @@ class PiSessionsHost {
 	registerSessionFile(sessionFile: string, cwd: string, name?: string): void {
 		const registry = loadMultiplexRegistry();
 		if (registry.some((s) => s.sessionFile === sessionFile)) return;
+		const realName =
+			name ||
+			readFirstMessage(sessionFile) ||
+			path.basename(cwd) ||
+			"session";
 		registry.unshift({
 			id: `sess-${Date.now().toString(36)}`,
 			sessionFile,
 			cwd,
-			name: name || readFirstMessage(sessionFile) || path.basename(cwd),
+			name: realName,
 			pinned: false,
 			createdAt: Date.now(),
 			lastActivityAt: Date.now(),
@@ -646,29 +669,25 @@ class PiSessionsHost {
 		_orgMode: "state" | "directory",
 		currentCwd: string,
 	): Promise<any[]> {
-		const registry = loadMultiplexRegistry();
 		const parentRecord = this.records.get(PARENT_SESSION_ID);
 		if (parentRecord?.sessionFile) {
 			this.persistSessionRecord(parentRecord);
 		}
 
-		// Reload registry to reflect current state
 		const currentRegistry = loadMultiplexRegistry();
 		const result: any[] = [];
 		const seenFiles = new Set<string>();
+		const activeFile = this.getActiveSessionFile();
 
 		for (const entry of currentRegistry) {
-			if (seenFiles.has(entry.sessionFile)) continue;
+			if (!entry.sessionFile || seenFiles.has(entry.sessionFile)) continue;
 			seenFiles.add(entry.sessionFile);
 
 			const live = [...this.records.values()].find(
-				(r) => r.sessionFile === entry.sessionFile || r.id === entry.id,
+				(r) => r.sessionFile === entry.sessionFile,
 			);
 
-			const isCurrent =
-				live &&
-				(live.id === this.activeId ||
-					(live.id === PARENT_SESSION_ID && (!this.activeId || this.activeId === PARENT_SESSION_ID)));
+			const isCurrent = Boolean(activeFile && activeFile === entry.sessionFile);
 
 			let state: "needs_input" | "working" | "completed" = "completed";
 			let agentStatus = "idle";
@@ -696,7 +715,7 @@ class PiSessionsHost {
 				summary,
 				modified: new Date(entry.lastActivityAt || entry.createdAt || Date.now()),
 				isLive: Boolean(live),
-				isCurrent: Boolean(isCurrent),
+				isCurrent,
 				sessionFile: entry.sessionFile,
 				pinned: Boolean(entry.pinned),
 			});
@@ -1086,7 +1105,13 @@ export default function (pi: ExtensionAPI) {
 		host.updateActivity(ctx, "idle");
 	});
 
-	pi.on("session_start", async (_event: any, ctx: CommandContext) => {
+	pi.on("session_start", async (event: any, ctx: CommandContext) => {
+		if (event?.previousSessionFile) {
+			host.registerSessionFile(
+				event.previousSessionFile,
+				ctx.cwd || process.cwd(),
+			);
+		}
 		if (ctx.mode !== "tui") return;
 		host.bindSessionContext(ctx);
 		installWidget(ctx, host);
