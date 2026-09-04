@@ -1,0 +1,24 @@
+{
+  "$schema": "https://unpkg.com/@aliou/pi-guardrails@0.17.1/schema.json",
+  "pathAccess": {
+    "allowedPaths": [
+      {
+        "kind": "directory",
+        "path": "~/Projects/pi-sessions"
+      },
+      {
+        "kind": "directory",
+        "path": "~/.n/lib/node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive"
+      },
+      {
+        "kind": "directory",
+        "path": "~/.n/lib/node_modules/@earendil-works"
+      },
+      {
+        "kind": "directory",
+        "path": ""
+      }
+    ]
+  },
+  "version": "0.17.1"
+}

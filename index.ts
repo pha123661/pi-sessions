@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 // @ts-nocheck
 import fs from "node:fs";
 import os from "node:os";
@@ -500,6 +501,44 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 	};
 };
 
+
+const branchCache = new Map<string, { branch: string; time: number }>();
+
+function getGitBranch(cwd: string): string {
+	if (!cwd) return "";
+	const cached = branchCache.get(cwd);
+	if (cached && Date.now() - cached.time < 10000) {
+		return cached.branch;
+	}
+	try {
+		const branch = execSync("git rev-parse --abbrev-ref HEAD", {
+			cwd,
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			timeout: 1000,
+		}).trim();
+		branchCache.set(cwd, { branch, time: Date.now() });
+		return branch;
+	} catch {
+		branchCache.set(cwd, { branch: "", time: Date.now() });
+		return "";
+	}
+}
+
+function getDefaultScope(): "current" | "all" {
+	try {
+		const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
+		if (fs.existsSync(settingsPath)) {
+			const raw = fs.readFileSync(settingsPath, "utf8");
+			const data = JSON.parse(raw);
+			if (data?.sessions?.defaultScope === "all" || data?.sessionsDefaultScope === "all") {
+				return "all";
+			}
+		}
+	} catch {}
+	return "current";
+}
+
 class PiSessionsHost {
 	activeId = PARENT_SESSION_ID;
 	records = new Map<string, LiveSessionRecord>();
@@ -567,6 +606,148 @@ class PiSessionsHost {
 			updatedAt: Date.now(),
 			sessions: this.listLive().map((r) => this.publicSession(r)),
 		};
+	}
+
+	
+	pinnedSessionIds = new Set<string>();
+
+	togglePin(idOrPath: string): void {
+		if (this.pinnedSessionIds.has(idOrPath)) {
+			this.pinnedSessionIds.delete(idOrPath);
+		} else {
+			this.pinnedSessionIds.add(idOrPath);
+		}
+		this.notify();
+	}
+
+	async renameSession(idOrPath: string, newName: string): Promise<void> {
+		const trimmed = (newName || "").trim();
+		if (!trimmed) return;
+		const live = this.get(idOrPath);
+		if (live) {
+			live.name = trimmed;
+			if (live.sessionFile && fs.existsSync(live.sessionFile)) {
+				try {
+					const sm = SessionManager.open(live.sessionFile);
+					sm.appendSessionInfo(trimmed);
+				} catch {}
+			}
+		} else if (fs.existsSync(idOrPath)) {
+			try {
+				const sm = SessionManager.open(idOrPath);
+				sm.appendSessionInfo(trimmed);
+			} catch {}
+		}
+		this.notify();
+	}
+
+	async dispatchChildWithPrompt(
+		ctx: CommandContext,
+		promptText: string,
+		cwd?: string,
+	): Promise<LiveSessionRecord> {
+		const targetCwd = cwd || ctx.cwd || process.cwd();
+		const child = await this.createChildFromContext(ctx, targetCwd);
+		child.activity = "working";
+		child.transcript = promptText;
+		this.notify();
+
+		try {
+			child.runtime?.session?.subscribe?.((event: any) => {
+				if (event.type === "agent_start" || event.type === "turn_start") {
+					child.activity = "working";
+					child.lastActivityAt = Date.now();
+					this.notify();
+				} else if (event.type === "agent_end") {
+					child.activity = "idle";
+					child.lastActivityAt = Date.now();
+					this.notify();
+				} else if (event.type === "tool_execution_start") {
+					child.transcript = `Running ${event.toolName}...`;
+					this.notify();
+				}
+			});
+		} catch {}
+
+		// Execute prompt in background
+		child.runPromise = (async () => {
+			try {
+				await child.runtime.session.prompt(promptText);
+			} catch (err: any) {
+				child.error = String(err?.message || err);
+			} finally {
+				child.activity = "idle";
+				child.transcript = resolveTranscriptName(child.name, child.sessionFile) || promptText;
+				this.notify();
+			}
+		})();
+
+		return child;
+	}
+
+	async listUnifiedSessions(
+		scope: "current" | "all",
+		currentCwd: string,
+	): Promise<any[]> {
+		const liveRecords = this.listLive();
+		const liveFiles = new Set<string>();
+		const result: any[] = [];
+
+		for (const r of liveRecords) {
+			if (r.sessionFile) liveFiles.add(r.sessionFile);
+			if (scope === "current" && r.cwd && path.resolve(r.cwd) !== path.resolve(currentCwd)) {
+				continue;
+			}
+			const isCurrent =
+				r.id === this.activeId ||
+				(r.id === PARENT_SESSION_ID && (!this.activeId || this.activeId === PARENT_SESSION_ID));
+			
+			const state = r.activity === "working" ? "working" : (isCurrent || r.activity === "waiting" ? "needs_input" : "completed");
+			
+			result.push({
+				id: r.id,
+				name: r.id === PARENT_SESSION_ID ? "current session" : (r.name || "session"),
+				cwd: r.cwd,
+				branch: getGitBranch(r.cwd),
+				state,
+				agentStatus: r.activity || "idle",
+				summary: r.transcript || resolveTranscriptName(r.name, r.sessionFile) || r.name,
+				modified: new Date(r.lastActivityAt || r.createdAt),
+				isLive: true,
+				isCurrent,
+				sessionFile: r.sessionFile,
+				pinned: this.pinnedSessionIds.has(r.id) || (r.sessionFile ? this.pinnedSessionIds.has(r.sessionFile) : false),
+			});
+		}
+
+		// Load saved sessions from disk
+		try {
+			const savedSessions = scope === "current"
+				? await SessionManager.list(currentCwd)
+				: await SessionManager.listAll();
+
+			for (const s of savedSessions) {
+				if (s.path && liveFiles.has(s.path)) {
+					continue;
+				}
+				result.push({
+					id: s.path,
+					name: s.name || "General assistance",
+					cwd: s.cwd || currentCwd,
+					branch: getGitBranch(s.cwd || currentCwd),
+					state: "completed",
+					agentStatus: "idle",
+					summary: s.firstMessage || s.name || "No summary",
+					modified: s.modified ? new Date(s.modified) : new Date(s.created || Date.now()),
+					isLive: false,
+					isCurrent: false,
+					sessionFile: s.path,
+					pinned: this.pinnedSessionIds.has(s.path),
+				});
+			}
+		} catch {}
+
+		return result;
 	}
 
 	listLive(): LiveSessionRecord[] {
@@ -935,39 +1116,43 @@ async function openSessions(
 	let targetToActivate: string | null = null;
 	let targetToKill: string | null = null;
 	await showSessionsView(ctx, {
-		getSessions: async () =>
-			host.listLive().map((record) => host.publicSession(record)),
-		getResumeSessions,
+		getSessions: async (scope: "current" | "all") =>
+			host.listUnifiedSessions(scope, ctx.cwd || process.cwd()),
+		getDefaultScope: () => getDefaultScope(),
 		getAttached: () => host.activeId,
 		getCwd: () => ctx.cwd || process.cwd(),
 		switchTo: async (id: string) => {
 			const target = host.get(id === "parent" ? PARENT_SESSION_ID : id);
-			if (!target) throw new Error(`session not found: ${id}`);
+			if (!target) {
+				// Might be a saved session path
+				const child = await host.openSavedSessionAsLive(id, undefined, ctx);
+				targetToActivate = child.id;
+				return;
+			}
 			targetToActivate = target.id;
 		},
-		newSession: async () => {
-			const child = await host.createChildFromContext(
+		dispatchSession: async (prompt: string, cwd?: string) => {
+			const child = await host.dispatchChildWithPrompt(
 				ctx,
-				ctx.cwd || process.cwd(),
+				prompt,
+				cwd || ctx.cwd || process.cwd(),
 			);
-			targetToActivate = child.id;
+			return child.id;
 		},
-		newSessionInFolder: async (cwd: string) => {
-			const child = await host.createChildFromContext(ctx, cwd);
-			targetToActivate = child.id;
-		},
-		resumeSession: async (sessionPath?: string) => {
-			if (!sessionPath) {
-				const sessions = await getResumeSessions();
-				sessionPath = sessions[0]?.path;
-			}
-			if (!sessionPath) throw new Error("No saved sessions found");
+		resumeSession: async (sessionPath: string) => {
 			const child = await host.openSavedSessionAsLive(
 				sessionPath,
 				undefined,
 				ctx,
 			);
 			targetToActivate = child.id;
+			return child.id;
+		},
+		renameSession: async (idOrPath: string, newName: string) => {
+			await host.renameSession(idOrPath, newName);
+		},
+		togglePinSession: (idOrPath: string) => {
+			host.togglePin(idOrPath);
 		},
 		killSession: async (id: string) => {
 			targetToKill = id;

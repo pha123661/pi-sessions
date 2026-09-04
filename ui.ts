@@ -15,18 +15,30 @@ import {
 	type Focusable,
 } from "@earendil-works/pi-tui";
 
-type SessionInfo = {
+
+export type UnifiedSessionInfo = {
 	id: string;
 	name: string;
 	cwd: string;
-	state: string;
+	state: "needs_input" | "working" | "completed";
 	status?: string;
 	pid?: number | null;
 	lastActivityAt?: number;
 	agentStatus?: string;
 	transcript?: string;
 	shortName?: string;
+	branch?: string;
+	summary?: string;
+	modified?: Date;
+	isLive?: boolean;
+	isCurrent?: boolean;
+	sessionFile?: string;
+	pinned?: boolean;
+	index?: number;
 };
+
+type SessionInfo = UnifiedSessionInfo;
+
 
 type SavedSessionInfo = {
 	path: string;
@@ -39,14 +51,16 @@ type SavedSessionInfo = {
 };
 
 type SessionsActions = {
-	getSessions: () => Promise<SessionInfo[]>;
+	getSessions: (scope: "current" | "all") => Promise<UnifiedSessionInfo[]>;
 	getResumeSessions?: () => Promise<SavedSessionInfo[]>;
 	getAttached: () => string | null;
 	getCwd: () => string;
+	getDefaultScope?: () => "current" | "all";
 	switchTo: (id: string) => Promise<void>;
-	newSession: () => Promise<void>;
-	newSessionInFolder: (cwd: string) => Promise<void>;
-	resumeSession: (sessionPath?: string) => Promise<void>;
+	dispatchSession?: (prompt: string, cwd?: string) => Promise<string>;
+	resumeSession: (sessionPath?: string) => Promise<string | void>;
+	renameSession?: (idOrPath: string, newName: string) => Promise<void>;
+	togglePinSession?: (idOrPath: string) => void;
 	killSession: (id: string) => Promise<void>;
 	notify: (message: string, type?: "info" | "warning" | "error") => void;
 };
@@ -66,15 +80,44 @@ type WorkingIndicatorOptions = {
 	intervalMs?: number;
 };
 
-function isCtrl(data: string, key: "o" | "r" | "k" | "p" | "n"): boolean {
+function isCtrl(data: string, key: "o" | "r" | "k" | "p" | "n" | "s" | "t" | "x" | "j" | "c"): boolean {
 	const codes: Record<string, string> = {
 		o: "\x0f",
 		r: "\x12",
 		k: "\x0b",
 		p: "\x10",
 		n: "\x0e",
+		s: "\x13",
+		t: "\x14",
+		x: "\x18",
+		j: "\x0a",
+		c: "\x03",
 	};
 	return data === codes[key] || matchesKey(data, Key.ctrl(key));
+}
+
+function isAltDigit(data: string): number | null {
+	if (data.length === 2 && data[0] === "\x1b" && data[1] >= "1" && data[1] <= "9") {
+		return parseInt(data[1], 10);
+	}
+	return null;
+}
+
+function formatRelativeTime(date?: Date): string {
+	if (!date) return "now";
+	const diffMs = Date.now() - date.getTime();
+	if (diffMs < 0 || !Number.isFinite(diffMs)) return "now";
+	const sec = Math.floor(diffMs / 1000);
+	if (sec < 60) return `${sec}s`;
+	const min = Math.floor(sec / 60);
+	if (min < 60) return `${min}m`;
+	const hour = Math.floor(min / 60);
+	if (hour < 24) return `${hour}h`;
+	const day = Math.floor(hour / 24);
+	if (day < 30) return `${day}d`;
+	const mo = Math.floor(day / 30);
+	if (mo < 12) return `${mo}mo`;
+	return `${Math.floor(day / 365)}y`;
 }
 
 function padVisible(text: string, width: number): string {
@@ -841,22 +884,24 @@ class ResumeSessionPicker implements Component, Focusable {
 }
 
 class SessionsView {
-	private sessions: SessionInfo[] = [];
+	private sessions: UnifiedSessionInfo[] = [];
+	private displayList: UnifiedSessionInfo[] = [];
 	private selected = 0;
+	private scope: "current" | "all" = "current";
 	private loading = true;
 	private error: string | null = null;
 	private closed = false;
-	private initialSelectionSet = false;
-	private nameWidth = 30;
-	private readonly filterInput = new Input();
+	private readonly taskInput = new Input();
+	private renameMode = false;
+	private readonly renameInput = new Input();
+	private showPeek = false;
+	private showHelp = false;
+	private lastCtrlCTime = 0;
 	private readonly theme: any;
 	private readonly done: () => void;
 	private readonly actions: SessionsActions;
 	private readonly requestRender: () => void;
-	private folderExplorer: FileExplorer | null = null;
-	private resumePicker: ResumeSessionPicker | null = null;
 	private timer: NodeJS.Timeout | null = null;
-	private showPeek = false;
 
 	constructor(
 		theme: any,
@@ -868,7 +913,8 @@ class SessionsView {
 		this.done = done;
 		this.actions = actions;
 		this.requestRender = requestRender;
-		this.filterInput.focused = true;
+		this.scope = actions.getDefaultScope?.() || "current";
+		this.taskInput.focused = true;
 		void this.refresh();
 		this.timer = setInterval(() => void this.refresh(), 1200);
 	}
@@ -882,92 +928,49 @@ class SessionsView {
 	private async refresh(): Promise<void> {
 		try {
 			this.error = null;
-			this.sessions = await this.actions.getSessions();
-			computeShortNames(this.sessions);
-			// Sort: working (non-current) first, then rest, current last
-			{
-				const attached = this.actions.getAttached();
-				const current: SessionInfo[] = [];
-				const working: SessionInfo[] = [];
-				const rest: SessionInfo[] = [];
-				for (const s of this.sessions) {
-					const isCurrent =
-						s.id === PARENT_SESSION_ID
-							? !attached || attached === PARENT_SESSION_ID
-							: attached === s.name || attached === s.id;
-					if (isCurrent) {
-						current.push(s);
-						continue;
-					}
-					((s.agentStatus || "idle") === "working" ? working : rest).push(s);
-				}
-				this.sessions = [...working, ...rest, ...current];
+			this.sessions = await this.actions.getSessions(this.scope);
+
+			const needsInput: UnifiedSessionInfo[] = [];
+			const working: UnifiedSessionInfo[] = [];
+			const completed: UnifiedSessionInfo[] = [];
+
+			for (const s of this.sessions) {
+				if (s.state === "needs_input") needsInput.push(s);
+				else if (s.state === "working") working.push(s);
+				else completed.push(s);
 			}
-			if (!this.initialSelectionSet) {
-				this.updateNameWidth();
-				this.selected = this.firstNonCurrentIndex();
-				this.initialSelectionSet = true;
-			}
+
+			const sortGroup = (arr: UnifiedSessionInfo[]) => {
+				return arr.sort((a, b) => {
+					if (a.pinned && !b.pinned) return -1;
+					if (!a.pinned && b.pinned) return 1;
+					if (a.isCurrent && !b.isCurrent) return -1;
+					if (!a.isCurrent && b.isCurrent) return 1;
+					return (b.modified?.getTime() || 0) - (a.modified?.getTime() || 0);
+				});
+			};
+
+			const sortedNeedsInput = sortGroup(needsInput);
+			const sortedWorking = sortGroup(working);
+			const sortedCompleted = sortGroup(completed);
+
+			this.displayList = [...sortedNeedsInput, ...sortedWorking, ...sortedCompleted];
+			this.displayList.forEach((item, idx) => {
+				item.index = idx + 1;
+			});
+
 			this.clampSelection();
-		} catch (error) {
-			this.error = String(error);
+		} catch (err: any) {
+			this.error = String(err?.message || err);
 		} finally {
 			this.loading = false;
 			this.requestRender();
 		}
 	}
 
-	private filteredSessions(): SessionInfo[] {
-		const query = this.filterInput.getValue().trim();
-		return fuzzyFilter(this.sessions, query, (session) =>
-			[
-				session.shortName,
-				session.name,
-				session.cwd,
-				session.transcript,
-				session.state,
-			]
-				.filter(Boolean)
-				.join(" "),
-		);
-	}
-
-	private selectedSession(): SessionInfo | null {
-		return this.filteredSessions()[this.selected] || null;
-	}
-
-	private isCurrent(session: SessionInfo): boolean {
-		const attached = this.actions.getAttached();
-		if (session.id === PARENT_SESSION_ID)
-			return !attached || attached === PARENT_SESSION_ID;
-		return attached === session.name || attached === session.id;
-	}
-
-	private firstNonCurrentIndex(): number {
-		const sessions = this.filteredSessions();
-		const index = sessions.findIndex((session) => !this.isCurrent(session));
-		return index >= 0 ? index : 0;
-	}
-
 	private clampSelection(): void {
-		const max = Math.max(0, this.filteredSessions().length - 1);
+		const max = Math.max(0, this.displayList.length - 1);
 		this.selected = Math.max(0, Math.min(this.selected, max));
-	}
-
-	private updateNameWidth(): void {
-		const attached = this.actions.getAttached();
-		let maxW = 0;
-		for (const s of this.sessions) {
-			const isAttached =
-				s.id === PARENT_SESSION_ID
-					? !attached || attached === PARENT_SESSION_ID
-					: attached === s.name || attached === s.id;
-			const base = s.shortName || s.name;
-			const current = isAttached ? " (current)" : "";
-			const w = visibleWidth(`\u203a ${base}${current}`);
-			if (w > maxW) maxW = w;
-		}
-		this.nameWidth = Math.min(Math.max(maxW + 2, 10), 60);
 	}
 
 	private close(): void {
@@ -978,243 +981,357 @@ class SessionsView {
 	}
 
 	handleInput(data: string): void {
-		if (this.folderExplorer) {
-			this.folderExplorer.handleInput(data);
+		if (this.showHelp) {
+			if (data === "?" || matchesKey(data, "escape") || isCtrl(data, "c")) {
+				this.showHelp = false;
+				this.requestRender();
+			}
 			return;
 		}
-		if (this.resumePicker) {
-			this.resumePicker.handleInput(data);
+
+		if (this.renameMode) {
+			if (matchesKey(data, "escape")) {
+				this.renameMode = false;
+				this.requestRender();
+				return;
+			}
+			if (matchesKey(data, "return") || matchesKey(data, "enter")) {
+				const val = this.renameInput.getValue().trim();
+				const item = this.displayList[this.selected];
+				this.renameMode = false;
+				if (item && val) {
+					void this.actions.renameSession?.(item.sessionFile || item.id, val).then(() => this.refresh());
+				}
+				this.requestRender();
+				return;
+			}
+			this.renameInput.handleInput(data);
+			this.requestRender();
 			return;
 		}
-		if (matchesKey(data, "escape") || data === "\x1b[D") { // Esc or Left Arrow
+
+		// Help overlay
+		if (data === "?") {
+			this.showHelp = true;
+			this.requestRender();
+			return;
+		}
+
+		// Esc logic
+		if (matchesKey(data, "escape")) {
+			if (this.taskInput.getValue().length > 0) {
+				this.taskInput.setValue("");
+				this.requestRender();
+				return;
+			}
+			if (this.showPeek) {
+				this.showPeek = false;
+				this.requestRender();
+				return;
+			}
 			this.close();
 			return;
 		}
-		if (data === " ") { // Space for peek panel
-			this.showPeek = !this.showPeek;
-			this.requestRender();
+
+		// Ctrl+C logic
+		if (isCtrl(data, "c")) {
+			if (this.taskInput.getValue().length > 0) {
+				this.taskInput.setValue("");
+				this.requestRender();
+				return;
+			}
+			const now = Date.now();
+			if (now - this.lastCtrlCTime < 2000) {
+				this.close();
+			} else {
+				this.lastCtrlCTime = now;
+				this.actions.notify("Press Ctrl+C again to quit", "warning");
+			}
 			return;
 		}
-		if (isCtrl(data, "o")) {
-			this.folderExplorer = new FileExplorer(
-				this.actions.getCwd(),
-				this.theme,
-				(cwd: string | null) => {
-					this.folderExplorer = null;
-					if (cwd) {
-						void this.actions.newSessionInFolder(cwd).then(() => this.close());
-					} else {
-						this.requestRender();
-					}
-				},
-				this.requestRender,
-			);
-			this.requestRender();
+
+		// Ctrl+S: Switch view (Current folder vs All folders)
+		if (isCtrl(data, "s")) {
+			this.scope = this.scope === "current" ? "all" : "current";
+			this.selected = 0;
+			this.actions.notify(`Switched view: ${this.scope === "current" ? "Current folder" : "All folders"}`, "info");
+			void this.refresh();
 			return;
 		}
+
+		// Ctrl+T: Pin to top
+		if (isCtrl(data, "t")) {
+			const item = this.displayList[this.selected];
+			if (item) {
+				this.actions.togglePinSession?.(item.sessionFile || item.id);
+				void this.refresh();
+			}
+			return;
+		}
+
+		// Ctrl+R: Rename
 		if (isCtrl(data, "r")) {
-			// Instead of resume picker, Ctrl+R is now rename in Claude Code V2 mimicry.
-			// Implementing a full rename prompt would require another input state.
-            // For now, we'll notify it's a stub or trigger a basic rename UI if we had one.
-            this.actions.notify("Rename shortcut pressed (stub)", "info");
+			const item = this.displayList[this.selected];
+			if (item) {
+				this.renameMode = true;
+				setInputValueAtEnd(this.renameInput, item.name || "");
+				this.requestRender();
+			}
 			return;
 		}
+
+		// Ctrl+X: Stop / Kill
+		if (isCtrl(data, "x")) {
+			const item = this.displayList[this.selected];
+			if (item) {
+				if (item.isCurrent) {
+					this.actions.notify("Cannot stop the current foreground session.", "warning");
+					return;
+				}
+				void this.actions.killSession(item.id).then(() => this.refresh());
+			}
+			return;
+		}
+
+		// Alt+1 .. Alt+9: Quick attach
+		const altNum = isAltDigit(data);
+		if (altNum !== null) {
+			const target = this.displayList[altNum - 1];
+			if (target) {
+				if (target.isLive) {
+					void this.actions.switchTo(target.id).then(() => this.close());
+				} else {
+					void this.actions.resumeSession(target.sessionFile || target.id).then(() => this.close());
+				}
+			}
+			return;
+		}
+
+		// Navigation: Up
 		if (matchesKey(data, "up") || isCtrl(data, "p")) {
 			this.selected = Math.max(0, this.selected - 1);
 			this.requestRender();
 			return;
 		}
+
+		// Navigation: Down
 		if (matchesKey(data, "down") || isCtrl(data, "n")) {
-			this.selected = Math.min(
-				Math.max(0, this.filteredSessions().length - 1),
-				this.selected + 1,
-			);
+			this.selected = Math.min(this.displayList.length - 1, this.selected + 1);
 			this.requestRender();
 			return;
 		}
-		if (matchesKey(data, "return") || matchesKey(data, "enter") || data === "\x1b[C") { // Enter or Right Arrow
-            const val = this.filterInput.getValue().trim();
-            const session = this.selectedSession();
-            if (val) {
-                // Dispatch text
-                // In a real V2 we would send this to the waiting background session
-                // For this MVP we just notify.
-                this.actions.notify("Quick reply / Dispatch sent (stub): " + val, "info");
-                this.filterInput.setValue("");
-            } else {
-                // Attach
-                if (!session) return;
-                void this.actions.switchTo(session.id).then(() => this.close());
-            }
-			return;
-		}
-		if (isCtrl(data, "x") || isCtrl(data, "k")) {
-			const session = this.selectedSession();
-			if (!session) return;
-			if (session.id === PARENT_SESSION_ID) {
-				this.actions.notify("Cannot kill parent session.", "warning");
+
+		// Space: Toggle peek panel if taskInput is empty
+		if (data === " ") {
+			if (!this.taskInput.getValue()) {
+				this.showPeek = !this.showPeek;
+				this.requestRender();
 				return;
 			}
-			void this.actions.killSession(session.id).then(() => this.close());
+		}
+
+		// Ctrl+J: Insert newline
+		if (isCtrl(data, "j")) {
+			this.taskInput.handleInput("\n");
+			this.requestRender();
 			return;
 		}
 
-		const before = this.filterInput.getValue();
-		this.filterInput.handleInput(data);
-		if (this.filterInput.getValue() !== before) this.selected = 0;
-		this.clampSelection();
+		// Enter / Return / Right Arrow
+		if (matchesKey(data, "return") || matchesKey(data, "enter") || (data === "\x1b[C" && !this.taskInput.getValue())) {
+			const taskText = this.taskInput.getValue().trim();
+			if (taskText) {
+				// Dispatch new task in background!
+				this.taskInput.setValue("");
+				if (this.actions.dispatchSession) {
+					void this.actions.dispatchSession(taskText).then(() => {
+						this.actions.notify("Session dispatched in background", "info");
+						return this.refresh();
+					});
+				}
+				this.requestRender();
+				return;
+			}
+
+			// Open/attach selected session
+			const selected = this.displayList[this.selected];
+			if (!selected) return;
+			if (selected.isLive) {
+				void this.actions.switchTo(selected.id).then(() => this.close());
+			} else {
+				void this.actions.resumeSession(selected.sessionFile || selected.id).then(() => this.close());
+			}
+			return;
+		}
+
+		// Forward everything else to taskInput
+		this.taskInput.handleInput(data);
 		this.requestRender();
 	}
 
-	private visibleStart(total: number): number {
-		if (total <= SESSIONS_MAX_VISIBLE) return 0;
-		const half = Math.floor(SESSIONS_MAX_VISIBLE / 2);
-		return Math.min(
-			Math.max(0, this.selected - half),
-			total - SESSIONS_MAX_VISIBLE,
-		);
-	}
-
-	private padRows(
-		lines: string[],
-		width: number,
-		rendered: number,
-		totalItems: number,
-	): void {
-		const target = Math.min(
-			Math.max(totalItems, rendered),
-			SESSIONS_MAX_VISIBLE,
-		);
-		for (let i = rendered; i < target; i++) {
-			lines.push(" ".repeat(Math.max(0, width)));
-		}
-	}
-
-	private activity(session: SessionInfo): string {
-		return session.agentStatus || "idle";
-	}
-
 	render(width: number): string[] {
-		if (this.folderExplorer) return this.folderExplorer.render(width);
-		if (this.resumePicker) return this.resumePicker.render(width);
-
 		const th = this.theme;
-		const border = (color: "accent" | "dim" = "accent") =>
+		const border = (color: "accent" | "dim" = "dim") =>
 			th.fg(color, "─".repeat(Math.max(0, width)));
 		const accent = (s: string) => th.fg("accent", s);
 		const dim = (s: string) => th.fg("dim", s);
 		const muted = (s: string) => th.fg("muted", s);
-		const success = (s: string) => th.fg("success", s);
-		const error = (s: string) => th.fg("error", s);
+		const bold = (s: string) => th.bold(s);
+
 		const lines: string[] = [];
-		const attached = this.actions.getAttached();
-		const visibleSessions = this.filteredSessions();
-		const total = Math.max(1, visibleSessions.length);
 
-		lines.push(accent("Agent View") + dim(" · ") + muted(`${total} sessions`));
+		// Banner
+		const banner = "Your conversation moved to the background — enter opens it · esc returns to it · ctrl+c twice quits";
+		const viewLabel = this.scope === "current" ? "Current folder" : "All folders";
+		lines.push(accent(banner) + dim(`  ·  [${viewLabel}]`));
+		lines.push("");
+
+		const needsInput: UnifiedSessionInfo[] = [];
+		const working: UnifiedSessionInfo[] = [];
+		const completed: UnifiedSessionInfo[] = [];
+
+		for (const s of this.displayList) {
+			if (s.state === "needs_input") needsInput.push(s);
+			else if (s.state === "working") working.push(s);
+			else completed.push(s);
+		}
+
+		let globalIndex = 0;
+
+		const renderGroup = (title: string, items: UnifiedSessionInfo[], iconType: "active" | "bullet") => {
+			if (items.length === 0) return;
+			lines.push(bold(title));
+			for (const item of items) {
+				const isSelected = globalIndex === this.selected;
+				globalIndex++;
+
+				const marker = isSelected ? accent("› ") : "  ";
+				const icon = iconType === "active" ? accent("✻ ") : dim("∙ ");
+				const name = item.isCurrent ? "current session" : (item.name || "session");
+				const styledName = item.pinned
+					? bold(name) + dim(" 📌")
+					: isSelected
+						? bold(name)
+						: name;
+
+				// Width allocations
+				const nameColWidth = 24;
+				const branchColWidth = 16;
+				const tagText = item.index !== undefined && item.index <= 9 ? dim(`#${item.index} `) : "";
+				const timeText = dim(formatRelativeTime(item.modified));
+				const rightPart = `${tagText}${timeText}`;
+				const rightWidth = visibleWidth(rightPart);
+
+				const leftPart = `${marker}${icon}${styledName}`;
+				const leftPadded = padVisible(leftPart, nameColWidth + 4);
+
+				const branchPart = item.branch ? dim(`⑂ ${item.branch}`) : "";
+				const branchPadded = padVisible(branchPart, branchColWidth);
+
+				const usedWidth = visibleWidth(leftPadded) + visibleWidth(branchPadded) + rightWidth + 4;
+				const summaryWidth = Math.max(10, width - usedWidth);
+				const summaryText = muted(truncateToWidth(item.summary || "", summaryWidth, "…"));
+
+				const row = `${leftPadded}${branchPadded}${padVisible(summaryText, summaryWidth)}  ${rightPart}`;
+				lines.push(isSelected ? th.bg("selectedBg", row) : row);
+			}
+			lines.push("");
+		};
+
+		renderGroup("Needs input", needsInput, "active");
+		renderGroup("Working", working, "active");
+		renderGroup("Completed", completed, "bullet");
+
+		if (this.displayList.length === 0) {
+			lines.push(dim("  No sessions found."));
+			lines.push("");
+		}
+
+		// Peek Panel
+		if (this.showPeek) {
+			const selectedItem = this.displayList[this.selected];
+			lines.push(border("dim"));
+			const peekTitle = selectedItem ? ` Peek: ${selectedItem.name} ` : " Peek ";
+			lines.push(bold(peekTitle) + dim("─".repeat(Math.max(0, width - visibleWidth(peekTitle)))));
+			const transcriptText = selectedItem?.summary || "(no recent activity)";
+			const parts = transcriptText.split("\n");
+			for (const p of parts.slice(-6)) {
+				lines.push(padVisible(`  ${muted(p)}`, width));
+			}
+			lines.push(border("dim"));
+		}
+
+		// Help modal overlay
+		if (this.showHelp) {
+			lines.push(border("accent"));
+			lines.push(bold(" Keyboard Shortcuts "));
+			lines.push(dim("  Enter          Attach to session (if prompt empty) or dispatch new task"));
+			lines.push(dim("  Ctrl+Enter     Dispatch and attach immediately"));
+			lines.push(dim("  Esc            Clear prompt, close peek, or return to conversation"));
+			lines.push(dim("  Ctrl+C         Clear prompt; press twice to quit"));
+			lines.push(dim("  Ctrl+S         Switch view (Current folder vs All folders)"));
+			lines.push(dim("  Ctrl+T         Pin / unpin selected session to top"));
+			lines.push(dim("  Ctrl+R         Rename selected session"));
+			lines.push(dim("  Ctrl+X         Stop / kill selected live session"));
+			lines.push(dim("  Alt+1..Alt+9   Directly open session #1 through #9"));
+			lines.push(dim("  Space          Toggle transcript peek panel"));
+			lines.push(dim("  Ctrl+J         Insert newline into prompt"));
+			lines.push(dim("  ?              Close help"));
+			lines.push(border("accent"));
+		}
+
+		// Fill remaining vertical space to push footer to bottom
+		const termHeight = process.stdout.rows || 24;
+		const footerHeight = 5;
+		const remaining = Math.max(1, termHeight - lines.length - footerHeight);
+		for (let i = 0; i < remaining; i++) {
+			lines.push(" ".repeat(width));
+		}
+
+		// Bottom section
 		lines.push(border("dim"));
-
-		const startIdx = this.visibleStart(visibleSessions.length);
-		const endIdx = Math.min(
-			visibleSessions.length,
-			startIdx + SESSIONS_MAX_VISIBLE,
-		);
-		let rendered = 0;
-		if (this.error) {
-			lines.push(padVisible(`  ${error("error")} ${this.error}`, width));
-			rendered = 1;
-		} else if (visibleSessions.length === 0) {
+		if (this.renameMode) {
+			const prompt = accent("Rename: ");
+			const inputRendered = renderInputChild(this.renameInput, width - 12);
+			lines.push(padVisible(`${prompt}${inputRendered}`, width));
+			lines.push(border("dim"));
+			lines.push(padVisible(dim("  enter to save          esc to cancel"), width));
+			lines.push("");
+		} else {
+			const prompt = accent("❯ ");
+			const inputRendered = renderInputChild(this.taskInput, width - 4);
+			const placeholder = this.taskInput.getValue()
+				? inputRendered
+				: dim("describe a task for a new session");
+			lines.push(padVisible(`${prompt}${placeholder}`, width));
+			lines.push(border("dim"));
 			lines.push(
 				padVisible(
-					`  ${dim(this.loading ? "Loading…" : "No sessions")}`,
+					dim("  ctrl+r to rename          ctrl+j for newline    ctrl+t to pin to top    ctrl+x to stop    ? to close"),
 					width,
 				),
 			);
-			rendered = 1;
-		} else {
-			const nameW = this.nameWidth;
-			const stateW = 9;
-			for (let i = startIdx; i < endIdx; i++) {
-				const session = visibleSessions[i]!;
-				const selected = i === this.selected;
-				const isAttached =
-					session.id === PARENT_SESSION_ID
-						? !attached || attached === PARENT_SESSION_ID
-						: attached === session.name || attached === session.id;
-				const marker = selected ? "›" : " ";
-				const base = session.shortName || session.name;
-				const current = isAttached ? " (current)" : "";
-				const leftPlain = `${marker} ${base}${current}`;
-				const tmp = selected
-					? accent(`${marker} ${base}`)
-					: `${marker} ${base}`;
-				const styledBase = `${tmp}${dim(current)}`;
-				const styledLeft = padVisible(styledBase, nameW);
-				const state = this.activity(session);
-				const styledState = muted(padVisible(state, stateW));
-				const cwdText = session.cwd || "";
-				const cwdWidth = visibleWidth(cwdText);
-				const cwd = muted(cwdText);
-				const transcript = muted(
-					truncateToWidth(
-						session.transcript || "",
-						Math.max(0, width - nameW - stateW - cwdWidth - 2),
-						"…",
-					),
-				);
-				lines.push(
-					padVisible(`${styledLeft}${styledState}${cwd}  ${transcript}`, width),
-				);
-				rendered++;
-			}
+			lines.push(
+				padVisible(
+					dim("  ctrl+s to switch views    @ to mention          alt+1 to open           esc to quit"),
+					width,
+				),
+			);
 		}
-		this.padRows(lines, width, rendered, this.sessions.length);
-        lines.push(border("dim"));
-        
-        // Peek panel
-        if (this.showPeek) {
-            const selectedSession = this.selectedSession();
-            lines.push(accent(" Peek ") + dim("─".repeat(Math.max(0, width - 6))));
-            const trText = selectedSession?.transcript || "(no recent activity)";
-            const parts = trText.split("\n");
-            for (const pt of parts) {
-                lines.push(padVisible("  " + pt, width));
-            }
-            lines.push(border("dim"));
-        }
 
-        // Input bottom bar
-		const renderedInput = renderInputChild(this.filterInput, width - 2);
-        lines.push(accent("❯ ") + renderedInput);
-        
-		lines.push(
-			padVisible(
-				dim("←") +
-					muted(" detach · ") +
-					dim("→/<enter>") +
-					muted(" attach · ") +
-					dim("<space>") +
-					muted(" peek · ") +
-					dim("<C-x>") +
-					muted(" kill · ") +
-                    dim("<C-r>") +
-                    muted(" rename"),
-				width,
-			),
-		);
 		return lines;
 	}
 
 	invalidate(): void {
-		this.filterInput.invalidate();
-		this.folderExplorer?.invalidate();
-		this.resumePicker?.invalidate();
+		this.taskInput.invalidate();
+		this.renameInput.invalidate();
 	}
 
 	dispose(): void {
 		if (this.timer) clearInterval(this.timer);
 	}
 }
+
 export async function showSessionsView(
 	ctx: any,
 	actions: SessionsActions,
