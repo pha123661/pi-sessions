@@ -381,7 +381,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		}
 	}
 
-	const session = await createAgentSessionFromServices({
+	const result = await createAgentSessionFromServices({
 		services,
 		sessionManager,
 		sessionStartEvent,
@@ -390,7 +390,7 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 	});
 
 	return {
-		session,
+		...result,
 		services,
 		diagnostics: services.diagnostics,
 	};
